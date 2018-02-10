@@ -28,7 +28,7 @@
 #define ETH_AF_XDP_QUEUE_IDX_ARG	"queue"
 #define ETH_AF_XDP_RING_SIZE_ARG	"ringsz"
 
-#define ETH_AF_XDP_FRAME_SIZE		2048	
+#define ETH_AF_XDP_FRAME_SIZE		2048
 #define ETH_AF_XDP_NUM_BUFFERS		131072
 #define ETH_AF_XDP_DFLT_RING_SIZE	1024
 #define ETH_AF_XDP_DFLT_QUEUE_IDX	0
@@ -267,8 +267,8 @@ eth_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info)
 	dev_info->if_index = internals->if_index;
 	dev_info->max_mac_addrs = 1;
 	dev_info->max_rx_pktlen = (uint32_t)ETH_FRAME_LEN;
-	dev_info->max_rx_queues = 1; 
-	dev_info->max_tx_queues = 1; 
+	dev_info->max_rx_queues = 1;
+	dev_info->max_tx_queues = 1;
 	dev_info->min_rx_bufsize = 0;
 }
 
@@ -839,7 +839,7 @@ rte_eth_from_packet(struct rte_vdev_device *dev,
 	return 0;
 }
 
-static void 
+static void
 parse_parameters(struct rte_kvargs *kvlist,
 		 char **if_name,
 		 int *queue_idx,
@@ -886,7 +886,7 @@ rte_pmd_af_xdp_probe(struct rte_vdev_device *dev)
 	ret = init_internals(dev, if_name, queue_idx, ring_size);
 	rte_kvargs_free(kvlist);
 
-	return ret;	
+	return ret;
 }
 
 static int
