@@ -24,18 +24,41 @@
 #include <unistd.h>
 #include <poll.h>
 
+#ifndef SOL_XDP
+#define SOL_XDP 283
+#endif
+
+#ifndef AF_XDP
+#define AF_XDP 44
+#endif
+
+#ifndef PF_XDP
+#define PF_XDP AF_XDP
+#endif
+
 #define ETH_AF_XDP_IFACE_ARG		"iface"
 #define ETH_AF_XDP_QUEUE_IDX_ARG	"queue"
 #define ETH_AF_XDP_RING_SIZE_ARG	"ringsz"
 
 #define ETH_AF_XDP_FRAME_SIZE		2048
 #define ETH_AF_XDP_NUM_BUFFERS		131072
+#define ETH_AF_XDP_DATA_HEADROOM	0
 #define ETH_AF_XDP_DFLT_RING_SIZE	1024
 #define ETH_AF_XDP_DFLT_QUEUE_IDX	0
+
+struct xdp_umem {
+	char *buffer;
+	size_t size;
+	unsigned int frame_size;
+	unsigned int frame_size_log2;
+	unsigned int nframes;
+	int mr_fd;
+};
 
 struct pmd_internals {
 	int sfd;
 	int if_index;
+	char if_name[0x100];
 	struct ether_addr eth_addr;
 	struct xdp_queue rx;
 	struct xdp_queue tx;
@@ -43,7 +66,6 @@ struct pmd_internals {
 	struct rte_mempool *mb_pool;
 
 	volatile unsigned long rx_pkts;
-	volatile unsigned long err_pkts;
 	volatile unsigned long rx_bytes;
 
 	volatile unsigned long tx_pkts;
@@ -70,6 +92,9 @@ static struct rte_eth_link pmd_link = {
 static uint16_t
 eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
+	(void)queue;
+	(void)bufs;
+	(void)nb_pkts;
 	return 0;
 }
 
@@ -79,6 +104,9 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 static uint16_t
 eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
+	(void)queue;
+	(void)bufs;
+	(void)nb_pkts;
 	return 0;
 }
 
@@ -120,21 +148,19 @@ eth_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info)
 static int
 eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 {
-	unsigned long rx_total = 0, tx_total = 0, tx_err_total = 0;
-	unsigned long rx_bytes_total = 0, tx_bytes_total = 0;
 	const struct pmd_internals *internal = dev->data->dev_private;
 
 	stats->ipackets = stats->q_ipackets[0] =
-		internal->rx_queue.rx_pkts;
+		internal->rx_pkts;
 	stats->ibytes = stats->q_ibytes[0] =
-		internal->rx_queue.rx_bytes;
+		internal->rx_bytes;
 
 	stats->opackets = stats->q_opackets[0]
-		= internal->tx_queue.tx_pkts;
+		= internal->tx_pkts;
 	stats->oerrors = stats->q_errors[0] =
-		internal->tx_queue.err_pkts;
+		internal->err_pkts;
 	stats->obytes =stats->q_obytes[0] =
-		internal->tx_queue.tx_bytes;
+		internal->tx_bytes;
 
 	return 0;
 }
@@ -142,15 +168,14 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 static void
 eth_stats_reset(struct rte_eth_dev *dev)
 {
-	unsigned i;
 	struct pmd_internals *internal = dev->data->dev_private;
 
-	internal->rx_queue.rx_pkts = 0;
-	internal->rx_queue.rx_bytes = 0;
+	internal->rx_pkts = 0;
+	internal->rx_bytes = 0;
 
-	internal->tx_queue.tx_pkts = 0;
-	internal->tx_queue.err_pkts = 0;
-	internal->tx_queue.tx_bytes = 0;
+	internal->tx_pkts = 0;
+	internal->err_pkts = 0;
+	internal->tx_bytes = 0;
 }
 
 static void
@@ -185,10 +210,9 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
 	internals->mb_pool = mb_pool;
 
 	/* Now get the space available for data in the mbuf */
-	buf_size = rte_pktmbuf_data_room_size(pkt_q->mb_pool) -
+	buf_size = rte_pktmbuf_data_room_size(internals->mb_pool) -
 		RTE_PKTMBUF_HEADROOM;
-	data_size = internals->req.tp_frame_size;
-	data_size -= TPACKET2_HDRLEN - sizeof(struct sockaddr_ll);
+	data_size = internals->umem->frame_size;
 
 	if (data_size > buf_size) {
 		RTE_LOG(ERR, PMD,
@@ -293,7 +317,7 @@ static const struct eth_dev_ops ops = {
 	.stats_reset = eth_stats_reset,
 };
 
-static struct rte_vdev_driver pmd_af_packet_drv;
+static struct rte_vdev_driver pmd_af_xdp_drv;
 
 static void
 parse_parameters(struct rte_kvargs *kvlist,
@@ -302,7 +326,7 @@ parse_parameters(struct rte_kvargs *kvlist,
 		 int *ring_size)
 {
 	struct rte_kvargs_pair *pair = NULL;
-	int k_idx;
+	unsigned k_idx;
 
 	for (k_idx = 0; k_idx < kvlist->count; k_idx++) {
 		pair = &kvlist->pairs[k_idx];
@@ -317,8 +341,8 @@ parse_parameters(struct rte_kvargs *kvlist,
 
 static struct xdp_umem *xsk_alloc_and_mem_reg_buffers(int sfd, size_t nbuffers)
 {
-	struct xdp_mr_req req = { .frame_size = FRAME_SIZE,
-				  .data_headroom = DATA_HEADROOM };
+	struct xdp_mr_req req = { .frame_size = ETH_AF_XDP_FRAME_SIZE,
+				  .data_headroom = ETH_AF_XDP_DATA_HEADROOM };
 	struct xdp_umem *umem;
 	void *bufs;
 	int ret;
@@ -340,7 +364,7 @@ static struct xdp_umem *xsk_alloc_and_mem_reg_buffers(int sfd, size_t nbuffers)
 	RTE_ASSERT(ret == 0);
 
 	umem->frame_size = ETH_AF_XDP_FRAME_SIZE;
-	umem->frame_size_log2 = log2(ETH_AF_XDP_FRAME_SIZE);
+	umem->frame_size_log2 = 11; 
 	umem->buffer = bufs;
 	umem->size = nbuffers * req.frame_size;
 	umem->nframes = nbuffers;
@@ -360,7 +384,7 @@ get_iface_info(const char *if_name,
 	if (sock < 0)
 		return -1;
 
-        strcpy(ifr.ifr_name, ifr_name);
+        strcpy(ifr.ifr_name, if_name);
 	if (ioctl(sock, SIOCGIFINDEX, &ifr))
 		goto error;
 	*if_index = ifr.ifr_ifindex;
@@ -382,19 +406,18 @@ static int
 init_internals(struct rte_vdev_device* dev,
 	       const char* if_name,
 	       int queue_idx,
-	       int ring_size);
+	       int ring_size)
 {
 	const char *name = rte_vdev_device_name(dev);
-	struct rte_eth_dev *rte_eth = NULL;
+	struct rte_eth_dev *eth_dev = NULL;
 	struct rte_eth_dev_data *data = NULL;
 	const unsigned int numa_node = dev->device.numa_node;
 	struct pmd_internals *internals;
-	sockaddr_xdp sxdp;
+	struct sockaddr_xdp sxdp;
 	struct xdp_ring_req req;
-	struct ifreq ifr;
 	int ret;
 
-	data = rte_zmalloc_socket(name, sizeof(**internals), 0, numa_node);
+	data = rte_zmalloc_socket(name, sizeof(*internals), 0, numa_node);
 	if (data == NULL)
 		return -1;
 
@@ -402,25 +425,27 @@ init_internals(struct rte_vdev_device* dev,
 	if (internals == NULL)
 		goto error_1;
 
+	strcpy(internals->if_name, if_name);
 	internals->sfd = socket(PF_XDP, SOCK_RAW, 0);
 	if (internals->sfd <0)
 		goto error_2;
 
-	ret = get_iface_info(if_name, &internals->ether_addr, &internals->if_index);
+	ret = get_iface_info(if_name, &internals->eth_addr, &internals->if_index);
 	if (ret)
 		goto error_3;
 
-	internals->umem = xsk_alloc_and_mem_reg_buffers(sfd, ETH_AF_XDP_NUM_BUFFERS);
+	internals->umem = xsk_alloc_and_mem_reg_buffers(internals->sfd,
+							ETH_AF_XDP_NUM_BUFFERS);
 	if (internals->umem == NULL)
 		goto error_3;
 
 	req.mr_fd = internals->umem->mr_fd;
 	req.desc_nr = ring_size;
 
-	ret = setsockopt(sfd, SOL_XDP, XDP_RX_RING, &req, sizeof(req);
+	ret = setsockopt(internals->sfd, SOL_XDP, XDP_RX_RING, &req, sizeof(req));
 	RTE_ASSERT(ret == 0);
 
-	ret = setsockopt(sfd, SOL_XDP, XDP_TX_RING, &req, sizeof(req);
+	ret = setsockopt(internals->sfd, SOL_XDP, XDP_TX_RING, &req, sizeof(req));
 	RTE_ASSERT(ret == 0);
 
 	internals->rx.ring = mmap(0, req.desc_nr * sizeof(struct xdp_desc),
@@ -430,8 +455,8 @@ init_internals(struct rte_vdev_device* dev,
 				  XDP_PGOFF_RX_RING);
 	RTE_ASSERT(internals->rx.ring != MAP_FAILED);
 
-	internals.rx.num_free = req.desc_nr;
-	internals.rx.ring_mask = req.desc_nr - 1;
+	internals->rx.num_free = req.desc_nr;
+	internals->rx.ring_mask = req.desc_nr - 1;
 
 	internals->tx.ring = mmap(0, req.desc_nr * sizeof(struct xdp_desc),
 				  PROT_READ | PROT_WRITE,
@@ -440,20 +465,20 @@ init_internals(struct rte_vdev_device* dev,
 				  XDP_PGOFF_TX_RING);
 	RTE_ASSERT(internals->tx.ring != MAP_FAILED);
 
-	internals.tx.num_free = req.desc_nr;
-	internals.tx.ring_mask = req.desc_nr - 1;
+	internals->tx.num_free = req.desc_nr;
+	internals->tx.ring_mask = req.desc_nr - 1;
 
 	sxdp.sxdp_family = PF_XDP;
-	sxdp.sxdp_if_index = internals->if_index;
+	sxdp.sxdp_ifindex = internals->if_index;
 	sxdp.sxdp_queue_id = queue_idx;
 
-	ret = bind(sfd, (struct sockaddr *)&sxdp, sizeof(sxdp));
+	ret = bind(internals->sfd, (struct sockaddr *)&sxdp, sizeof(sxdp));
 	RTE_ASSERT(ret == 0);
 
 	eth_dev = rte_eth_vdev_allocate(dev, 0);
 	if (eth_dev == NULL)
 		goto error_3;
-	rte_memcpy(data, (*eth_dev)->data, sizeof(*data));
+	rte_memcpy(data, eth_dev->data, sizeof(*data));
 	internals->port_id = eth_dev->data->port_id;
 	data->dev_private = internals;
 	data->nb_rx_queues = 1;
@@ -463,6 +488,9 @@ init_internals(struct rte_vdev_device* dev,
 
 	eth_dev->data = data;
 	eth_dev->dev_ops = &ops;
+
+	eth_dev->rx_pkt_burst = eth_af_xdp_rx;
+	eth_dev->tx_pkt_burst = eth_af_xdp_tx;
 
 	return 0;
 
@@ -481,17 +509,17 @@ static int
 rte_pmd_af_xdp_probe(struct rte_vdev_device *dev)
 {
 	struct rte_kvargs *kvlist;
-	int k_idx;
-	char *if_name;
+	char *if_name = NULL;;
 	int ring_size = ETH_AF_XDP_DFLT_RING_SIZE;
 	int queue_idx = ETH_AF_XDP_DFLT_QUEUE_IDX;
+	int ret;
 
 	RTE_LOG(INFO, PMD, "Initializing pmd_af_packet for %s\n",
 		rte_vdev_device_name(dev));
 
 	kvlist = rte_kvargs_parse(rte_vdev_device_args(dev), valid_arguments);
 	if (kvlist == NULL) {
-		PMD_INIT_LOG(ERR,
+		RTE_LOG(ERR, PMD,
 			"Invalid kvargs");
 		return -1;
 	}
@@ -512,7 +540,6 @@ rte_pmd_af_xdp_remove(struct rte_vdev_device *dev)
 {
 	struct rte_eth_dev *eth_dev = NULL;
 	struct pmd_internals *internals;
-	unsigned q;
 
 	RTE_LOG(INFO, PMD, "Closing AF_XDP ethdev on numa socket %u\n",
 			rte_socket_id());
@@ -526,9 +553,7 @@ rte_pmd_af_xdp_remove(struct rte_vdev_device *dev)
 		return -1;
 
 	internals = eth_dev->data->dev_private;
-	rte_free(internals->rx_queue.rd);
-	rte_free(internals->tx_queue.rd);
-	free(internals->if_name);
+	rte_free(internals->umem);
 	rte_free(eth_dev->data->dev_private);
 	rte_free(eth_dev->data);
 	close(internals->sfd);
