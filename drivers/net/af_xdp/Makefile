@@ -42,7 +42,7 @@ EXPORT_MAP := rte_pmd_af_xdp_version.map
 
 LIBABIVER := 1
 
-CFLAGS += -O3
+CFLAGS += -O3 -I/opt/af_xdp/linux_headers/include
 CFLAGS += $(WERROR_FLAGS)
 LDLIBS += -lrte_eal -lrte_mbuf -lrte_mempool -lrte_ring
 LDLIBS += -lrte_ethdev -lrte_net -lrte_kvargs

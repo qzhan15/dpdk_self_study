@@ -14,7 +14,7 @@
 #include <rte_bus_vdev.h>
 
 #include <linux/if_ether.h>
-#include <linux/if_packet.h>
+#include <linux/if_xdp.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/types.h>
@@ -38,7 +38,7 @@ struct pmd_internals {
 	int if_index;
 	struct ether_addr eth_addr;
 	struct xdp_queue rx;
-	struct xdq_queue tx;
+	struct xdp_queue tx;
 	struct xdp_umem *umem;
 	struct rte_mempool *mb_pool;
 
