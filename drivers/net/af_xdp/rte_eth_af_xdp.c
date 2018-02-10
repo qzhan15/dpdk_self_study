@@ -33,45 +33,24 @@
 #define ETH_AF_XDP_DFLT_RING_SIZE	1024
 #define ETH_AF_XDP_DFLT_QUEUE_IDX	0
 
-struct pkt_rx_queue {
-	int sockfd;
-
-	struct iovec *rd;
-	uint8_t *map;
-	unsigned int framecount;
-	unsigned int framenum;
-
+struct pmd_internals {
+	int sfd;
+	int if_index;
+	struct ether_addr eth_addr;
+	struct xdp_queue rx;
+	struct xdq_queue tx;
+	struct xdp_umem *umem;
 	struct rte_mempool *mb_pool;
-	uint16_t in_port;
 
 	volatile unsigned long rx_pkts;
 	volatile unsigned long err_pkts;
 	volatile unsigned long rx_bytes;
-};
-
-struct pkt_tx_queue {
-	int sockfd;
-	unsigned int frame_data_size;
-
-	struct iovec *rd;
-	uint8_t *map;
-	unsigned int framecount;
-	unsigned int framenum;
 
 	volatile unsigned long tx_pkts;
 	volatile unsigned long err_pkts;
 	volatile unsigned long tx_bytes;
-};
 
-struct pmd_internals {
-	int sfd;
-	int if_index;
-	char *if_name;
-	int queue_idx;
-	struct ether_addr eth_addr;
-
-	struct pkt_rx_queue rx_queue;
-	struct pkt_tx_queue tx_queue;
+	uint16_t port_id;
 };
 
 static const char *valid_arguments[] = {
@@ -91,61 +70,7 @@ static struct rte_eth_link pmd_link = {
 static uint16_t
 eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
-	unsigned i;
-	struct tpacket2_hdr *ppd;
-	struct rte_mbuf *mbuf;
-	uint8_t *pbuf;
-	struct pkt_rx_queue *pkt_q = queue;
-	uint16_t num_rx = 0;
-	unsigned long num_rx_bytes = 0;
-	unsigned int framecount, framenum;
-
-	if (unlikely(nb_pkts == 0))
-		return 0;
-
-	/*
-	 * Reads the given number of packets from the AF_PACKET socket one by
-	 * one and copies the packet data into a newly allocated mbuf.
-	 */
-	framecount = pkt_q->framecount;
-	framenum = pkt_q->framenum;
-	for (i = 0; i < nb_pkts; i++) {
-		/* point at the next incoming frame */
-		ppd = (struct tpacket2_hdr *) pkt_q->rd[framenum].iov_base;
-		if ((ppd->tp_status & TP_STATUS_USER) == 0)
-			break;
-
-		/* allocate the next mbuf */
-		mbuf = rte_pktmbuf_alloc(pkt_q->mb_pool);
-		if (unlikely(mbuf == NULL))
-			break;
-
-		/* packet will fit in the mbuf, go ahead and receive it */
-		rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf) = ppd->tp_snaplen;
-		pbuf = (uint8_t *) ppd + ppd->tp_mac;
-		memcpy(rte_pktmbuf_mtod(mbuf, void *), pbuf, rte_pktmbuf_data_len(mbuf));
-
-		/* check for vlan info */
-		if (ppd->tp_status & TP_STATUS_VLAN_VALID) {
-			mbuf->vlan_tci = ppd->tp_vlan_tci;
-			mbuf->ol_flags |= (PKT_RX_VLAN | PKT_RX_VLAN_STRIPPED);
-		}
-
-		/* release incoming frame and advance ring buffer */
-		ppd->tp_status = TP_STATUS_KERNEL;
-		if (++framenum >= framecount)
-			framenum = 0;
-		mbuf->port = pkt_q->in_port;
-
-		/* account for the receive frame */
-		bufs[i] = mbuf;
-		num_rx++;
-		num_rx_bytes += mbuf->pkt_len;
-	}
-	pkt_q->framenum = framenum;
-	pkt_q->rx_pkts += num_rx;
-	pkt_q->rx_bytes += num_rx_bytes;
-	return num_rx;
+	return 0;
 }
 
 /*
@@ -154,87 +79,7 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 static uint16_t
 eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
-	struct tpacket2_hdr *ppd;
-	struct rte_mbuf *mbuf;
-	uint8_t *pbuf;
-	unsigned int framecount, framenum;
-	struct pollfd pfd;
-	struct pkt_tx_queue *pkt_q = queue;
-	uint16_t num_tx = 0;
-	unsigned long num_tx_bytes = 0;
-	int i;
-
-	if (unlikely(nb_pkts == 0))
-		return 0;
-
-	memset(&pfd, 0, sizeof(pfd));
-	pfd.fd = pkt_q->sockfd;
-	pfd.events = POLLOUT;
-	pfd.revents = 0;
-
-	framecount = pkt_q->framecount;
-	framenum = pkt_q->framenum;
-	ppd = (struct tpacket2_hdr *) pkt_q->rd[framenum].iov_base;
-	for (i = 0; i < nb_pkts; i++) {
-		mbuf = *bufs++;
-
-		/* drop oversized packets */
-		if (mbuf->pkt_len > pkt_q->frame_data_size) {
-			rte_pktmbuf_free(mbuf);
-			continue;
-		}
-
-		/* insert vlan info if necessary */
-		if (mbuf->ol_flags & PKT_TX_VLAN_PKT) {
-			if (rte_vlan_insert(&mbuf)) {
-				rte_pktmbuf_free(mbuf);
-				continue;
-			}
-		}
-
-		/* point at the next incoming frame */
-		if ((ppd->tp_status != TP_STATUS_AVAILABLE) &&
-		    (poll(&pfd, 1, -1) < 0))
-			break;
-
-		/* copy the tx frame data */
-		pbuf = (uint8_t *) ppd + TPACKET2_HDRLEN -
-			sizeof(struct sockaddr_ll);
-
-		struct rte_mbuf *tmp_mbuf = mbuf;
-		while (tmp_mbuf) {
-			uint16_t data_len = rte_pktmbuf_data_len(tmp_mbuf);
-			memcpy(pbuf, rte_pktmbuf_mtod(tmp_mbuf, void*), data_len);
-			pbuf += data_len;
-			tmp_mbuf = tmp_mbuf->next;
-		}
-
-		ppd->tp_len = mbuf->pkt_len;
-		ppd->tp_snaplen = mbuf->pkt_len;
-
-		/* release incoming frame and advance ring buffer */
-		ppd->tp_status = TP_STATUS_SEND_REQUEST;
-		if (++framenum >= framecount)
-			framenum = 0;
-		ppd = (struct tpacket2_hdr *) pkt_q->rd[framenum].iov_base;
-
-		num_tx++;
-		num_tx_bytes += mbuf->pkt_len;
-		rte_pktmbuf_free(mbuf);
-	}
-
-	/* kick-off transmits */
-	if (sendto(pkt_q->sockfd, NULL, 0, MSG_DONTWAIT, NULL, 0) == -1) {
-		/* error sending -- no packets transmitted */
-		num_tx = 0;
-		num_tx_bytes = 0;
-	}
-
-	pkt_q->framenum = framenum;
-	pkt_q->tx_pkts += num_tx;
-	pkt_q->err_pkts += i - num_tx;
-	pkt_q->tx_bytes += num_tx_bytes;
-	return i;
+	return 0;
 }
 
 static int
@@ -334,10 +179,10 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
                    struct rte_mempool *mb_pool)
 {
 	struct pmd_internals *internals = dev->data->dev_private;
-	struct pkt_rx_queue *pkt_q = &internals->rx_queue[rx_queue_id];
 	unsigned int buf_size, data_size;
 
-	pkt_q->mb_pool = mb_pool;
+	RTE_ASSERT(rx_queue_id == 0);
+	internals->mb_pool = mb_pool;
 
 	/* Now get the space available for data in the mbuf */
 	buf_size = rte_pktmbuf_data_room_size(pkt_q->mb_pool) -
@@ -352,9 +197,7 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
 		return -ENOMEM;
 	}
 
-	dev->data->rx_queues[rx_queue_id] = pkt_q;
-	pkt_q->in_port = dev->data->port_id;
-
+	dev->data->rx_queues[rx_queue_id] = internals;
 	return 0;
 }
 
@@ -368,7 +211,8 @@ eth_tx_queue_setup(struct rte_eth_dev *dev,
 
 	struct pmd_internals *internals = dev->data->dev_private;
 
-	dev->data->tx_queues[tx_queue_id] = &internals->tx_queue[tx_queue_id];
+	RTE_ASSERT(tx_queue_id == 0);
+	dev->data->tx_queues[tx_queue_id] = internals;
 	return 0;
 }
 
@@ -451,394 +295,6 @@ static const struct eth_dev_ops ops = {
 
 static struct rte_vdev_driver pmd_af_packet_drv;
 
-static int
-rte_pmd_init_internals(struct rte_vdev_device *dev,
-                       struct rte_eth_dev **eth_dev,
-                       struct rte_kvargs *kvlist)
-{
-	const char *name = rte_vdev_device_name(dev);
-	const unsigned int numa_node = dev->device.numa_node;
-	struct rte_eth_dev_data *data = NULL;
-	struct rte_kvargs_pair *pair = NULL;
-	struct ifreq ifr;
-	size_t ifnamelen;
-	unsigned k_idx;
-	struct sockaddr_ll sockaddr;
-	struct tpacket_req *req;
-	struct pkt_rx_queue *rx_queue;
-	struct pkt_tx_queue *tx_queue;
-	int rc, tpver, discard;
-	int qsockfd = -1;
-	unsigned int i, q, rdsize;
-#if defined(PACKET_FANOUT)
-	int fanout_arg;
-#endif
-
-	for (k_idx = 0; k_idx < kvlist->count; k_idx++) {
-		pair = &kvlist->pairs[k_idx];
-		if (strstr(pair->key, ETH_AF_PACKET_IFACE_ARG) != NULL)
-			break;
-	}
-	if (pair == NULL) {
-		RTE_LOG(ERR, PMD,
-			"%s: no interface specified for AF_PACKET ethdev\n",
-		        name);
-		goto error_early;
-	}
-
-	RTE_LOG(INFO, PMD,
-		"%s: creating AF_PACKET-backed ethdev on numa socket %u\n",
-		name, numa_node);
-
-	/*
-	 * now do all data allocation - for eth_dev structure, dummy pci driver
-	 * and internal (private) data
-	 */
-	data = rte_zmalloc_socket(name, sizeof(*data), 0, numa_node);
-	if (data == NULL)
-		goto error_early;
-
-	*internals = rte_zmalloc_socket(name, sizeof(**internals),
-	                                0, numa_node);
-	if (*internals == NULL)
-		goto error_early;
-
-	for (q = 0; q < nb_queues; q++) {
-		(*internals)->rx_queue[q].map = MAP_FAILED;
-		(*internals)->tx_queue[q].map = MAP_FAILED;
-	}
-
-	req = &((*internals)->req);
-
-	req->tp_block_size = blocksize;
-	req->tp_block_nr = blockcnt;
-	req->tp_frame_size = framesize;
-	req->tp_frame_nr = framecnt;
-
-	ifnamelen = strlen(pair->value);
-	if (ifnamelen < sizeof(ifr.ifr_name)) {
-		memcpy(ifr.ifr_name, pair->value, ifnamelen);
-		ifr.ifr_name[ifnamelen] = '\0';
-	} else {
-		RTE_LOG(ERR, PMD,
-			"%s: I/F name too long (%s)\n",
-			name, pair->value);
-		goto error_early;
-	}
-	if (ioctl(sockfd, SIOCGIFINDEX, &ifr) == -1) {
-		RTE_LOG(ERR, PMD,
-			"%s: ioctl failed (SIOCGIFINDEX)\n",
-		        name);
-		goto error_early;
-	}
-	(*internals)->if_name = strdup(pair->value);
-	if ((*internals)->if_name == NULL)
-		goto error_early;
-	(*internals)->if_index = ifr.ifr_ifindex;
-
-	if (ioctl(sockfd, SIOCGIFHWADDR, &ifr) == -1) {
-		RTE_LOG(ERR, PMD,
-			"%s: ioctl failed (SIOCGIFHWADDR)\n",
-		        name);
-		goto error_early;
-	}
-	memcpy(&(*internals)->eth_addr, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
-
-	memset(&sockaddr, 0, sizeof(sockaddr));
-	sockaddr.sll_family = AF_PACKET;
-	sockaddr.sll_protocol = htons(ETH_P_ALL);
-	sockaddr.sll_ifindex = (*internals)->if_index;
-
-#if defined(PACKET_FANOUT)
-	fanout_arg = (getpid() ^ (*internals)->if_index) & 0xffff;
-	fanout_arg |= (PACKET_FANOUT_HASH | PACKET_FANOUT_FLAG_DEFRAG) << 16;
-#if defined(PACKET_FANOUT_FLAG_ROLLOVER)
-	fanout_arg |= PACKET_FANOUT_FLAG_ROLLOVER << 16;
-#endif
-#endif
-
-	for (q = 0; q < nb_queues; q++) {
-		/* Open an AF_PACKET socket for this queue... */
-		qsockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-		if (qsockfd == -1) {
-			RTE_LOG(ERR, PMD,
-			        "%s: could not open AF_PACKET socket\n",
-			        name);
-			return -1;
-		}
-
-		tpver = TPACKET_V2;
-		rc = setsockopt(qsockfd, SOL_PACKET, PACKET_VERSION,
-				&tpver, sizeof(tpver));
-		if (rc == -1) {
-			RTE_LOG(ERR, PMD,
-				"%s: could not set PACKET_VERSION on AF_PACKET "
-				"socket for %s\n", name, pair->value);
-			goto error;
-		}
-
-		discard = 1;
-		rc = setsockopt(qsockfd, SOL_PACKET, PACKET_LOSS,
-				&discard, sizeof(discard));
-		if (rc == -1) {
-			RTE_LOG(ERR, PMD,
-				"%s: could not set PACKET_LOSS on "
-			        "AF_PACKET socket for %s\n", name, pair->value);
-			goto error;
-		}
-
-#if defined(PACKET_QDISC_BYPASS)
-		rc = setsockopt(qsockfd, SOL_PACKET, PACKET_QDISC_BYPASS,
-				&qdisc_bypass, sizeof(qdisc_bypass));
-		if (rc == -1) {
-			RTE_LOG(ERR, PMD,
-				"%s: could not set PACKET_QDISC_BYPASS "
-			        "on AF_PACKET socket for %s\n", name,
-			        pair->value);
-			goto error;
-		}
-#else
-		RTE_SET_USED(qdisc_bypass);
-#endif
-
-		rc = setsockopt(qsockfd, SOL_PACKET, PACKET_RX_RING, req, sizeof(*req));
-		if (rc == -1) {
-			RTE_LOG(ERR, PMD,
-				"%s: could not set PACKET_RX_RING on AF_PACKET "
-				"socket for %s\n", name, pair->value);
-			goto error;
-		}
-
-		rc = setsockopt(qsockfd, SOL_PACKET, PACKET_TX_RING, req, sizeof(*req));
-		if (rc == -1) {
-			RTE_LOG(ERR, PMD,
-				"%s: could not set PACKET_TX_RING on AF_PACKET "
-				"socket for %s\n", name, pair->value);
-			goto error;
-		}
-
-		rx_queue = &((*internals)->rx_queue[q]);
-		rx_queue->framecount = req->tp_frame_nr;
-
-		rx_queue->map = mmap(NULL, 2 * req->tp_block_size * req->tp_block_nr,
-				    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_LOCKED,
-				    qsockfd, 0);
-		if (rx_queue->map == MAP_FAILED) {
-			RTE_LOG(ERR, PMD,
-				"%s: call to mmap failed on AF_PACKET socket for %s\n",
-				name, pair->value);
-			goto error;
-		}
-
-		/* rdsize is same for both Tx and Rx */
-		rdsize = req->tp_frame_nr * sizeof(*(rx_queue->rd));
-
-		rx_queue->rd = rte_zmalloc_socket(name, rdsize, 0, numa_node);
-		if (rx_queue->rd == NULL)
-			goto error;
-		for (i = 0; i < req->tp_frame_nr; ++i) {
-			rx_queue->rd[i].iov_base = rx_queue->map + (i * framesize);
-			rx_queue->rd[i].iov_len = req->tp_frame_size;
-		}
-		rx_queue->sockfd = qsockfd;
-
-		tx_queue = &((*internals)->tx_queue[q]);
-		tx_queue->framecount = req->tp_frame_nr;
-		tx_queue->frame_data_size = req->tp_frame_size;
-		tx_queue->frame_data_size -= TPACKET2_HDRLEN -
-			sizeof(struct sockaddr_ll);
-
-		tx_queue->map = rx_queue->map + req->tp_block_size * req->tp_block_nr;
-
-		tx_queue->rd = rte_zmalloc_socket(name, rdsize, 0, numa_node);
-		if (tx_queue->rd == NULL)
-			goto error;
-		for (i = 0; i < req->tp_frame_nr; ++i) {
-			tx_queue->rd[i].iov_base = tx_queue->map + (i * framesize);
-			tx_queue->rd[i].iov_len = req->tp_frame_size;
-		}
-		tx_queue->sockfd = qsockfd;
-
-		rc = bind(qsockfd, (const struct sockaddr*)&sockaddr, sizeof(sockaddr));
-		if (rc == -1) {
-			RTE_LOG(ERR, PMD,
-				"%s: could not bind AF_PACKET socket to %s\n",
-			        name, pair->value);
-			goto error;
-		}
-
-#if defined(PACKET_FANOUT)
-		rc = setsockopt(qsockfd, SOL_PACKET, PACKET_FANOUT,
-				&fanout_arg, sizeof(fanout_arg));
-		if (rc == -1) {
-			RTE_LOG(ERR, PMD,
-				"%s: could not set PACKET_FANOUT on AF_PACKET socket "
-				"for %s\n", name, pair->value);
-			goto error;
-		}
-#endif
-	}
-
-	/* reserve an ethdev entry */
-	*eth_dev = rte_eth_vdev_allocate(dev, 0);
-	if (*eth_dev == NULL)
-		goto error;
-
-	/*
-	 * now put it all together
-	 * - store queue data in internals,
-	 * - store numa_node in eth_dev
-	 * - point eth_dev_data to internals
-	 * - and point eth_dev structure to new eth_dev_data structure
-	 */
-
-	(*internals)->nb_queues = nb_queues;
-
-	rte_memcpy(data, (*eth_dev)->data, sizeof(*data));
-	data->dev_private = *internals;
-	data->nb_rx_queues = (uint16_t)nb_queues;
-	data->nb_tx_queues = (uint16_t)nb_queues;
-	data->dev_link = pmd_link;
-	data->mac_addrs = &(*internals)->eth_addr;
-
-	(*eth_dev)->data = data;
-	(*eth_dev)->dev_ops = &ops;
-
-	return 0;
-
-error:
-	if (qsockfd != -1)
-		close(qsockfd);
-	for (q = 0; q < nb_queues; q++) {
-		munmap((*internals)->rx_queue[q].map,
-		       2 * req->tp_block_size * req->tp_block_nr);
-
-		rte_free((*internals)->rx_queue[q].rd);
-		rte_free((*internals)->tx_queue[q].rd);
-		if (((*internals)->rx_queue[q].sockfd != 0) &&
-			((*internals)->rx_queue[q].sockfd != qsockfd))
-			close((*internals)->rx_queue[q].sockfd);
-	}
-	free((*internals)->if_name);
-	rte_free(*internals);
-error_early:
-	rte_free(data);
-	return -1;
-}
-
-static int
-rte_eth_from_packet(struct rte_vdev_device *dev,
-                    int const *sockfd,
-                    struct rte_kvargs *kvlist)
-{
-	const char *name = rte_vdev_device_name(dev);
-	struct pmd_internals *internals = NULL;
-	struct rte_eth_dev *eth_dev = NULL;
-	struct rte_kvargs_pair *pair = NULL;
-	unsigned k_idx;
-	unsigned int blockcount;
-	unsigned int blocksize = DFLT_BLOCK_SIZE;
-	unsigned int framesize = DFLT_FRAME_SIZE;
-	unsigned int framecount = DFLT_FRAME_COUNT;
-	unsigned int qpairs = 1;
-	unsigned int qdisc_bypass = 1;
-
-	/* do some parameter checking */
-	if (*sockfd < 0)
-		return -1;
-
-	/*
-	 * Walk arguments for configurable settings
-	 */
-	for (k_idx = 0; k_idx < kvlist->count; k_idx++) {
-		pair = &kvlist->pairs[k_idx];
-		if (strstr(pair->key, ETH_AF_PACKET_NUM_Q_ARG) != NULL) {
-			qpairs = atoi(pair->value);
-			if (qpairs < 1 ||
-			    qpairs > RTE_PMD_AF_PACKET_MAX_RINGS) {
-				RTE_LOG(ERR, PMD,
-					"%s: invalid qpairs value\n",
-				        name);
-				return -1;
-			}
-			continue;
-		}
-		if (strstr(pair->key, ETH_AF_PACKET_BLOCKSIZE_ARG) != NULL) {
-			blocksize = atoi(pair->value);
-			if (!blocksize) {
-				RTE_LOG(ERR, PMD,
-					"%s: invalid blocksize value\n",
-				        name);
-				return -1;
-			}
-			continue;
-		}
-		if (strstr(pair->key, ETH_AF_PACKET_FRAMESIZE_ARG) != NULL) {
-			framesize = atoi(pair->value);
-			if (!framesize) {
-				RTE_LOG(ERR, PMD,
-					"%s: invalid framesize value\n",
-				        name);
-				return -1;
-			}
-			continue;
-		}
-		if (strstr(pair->key, ETH_AF_PACKET_FRAMECOUNT_ARG) != NULL) {
-			framecount = atoi(pair->value);
-			if (!framecount) {
-				RTE_LOG(ERR, PMD,
-					"%s: invalid framecount value\n",
-				        name);
-				return -1;
-			}
-			continue;
-		}
-		if (strstr(pair->key, ETH_AF_PACKET_QDISC_BYPASS_ARG) != NULL) {
-			qdisc_bypass = atoi(pair->value);
-			if (qdisc_bypass > 1) {
-				RTE_LOG(ERR, PMD,
-					"%s: invalid bypass value\n",
-					name);
-				return -1;
-			}
-			continue;
-		}
-	}
-
-	if (framesize > blocksize) {
-		RTE_LOG(ERR, PMD,
-			"%s: AF_PACKET MMAP frame size exceeds block size!\n",
-		        name);
-		return -1;
-	}
-
-	blockcount = framecount / (blocksize / framesize);
-	if (!blockcount) {
-		RTE_LOG(ERR, PMD,
-			"%s: invalid AF_PACKET MMAP parameters\n", name);
-		return -1;
-	}
-
-	RTE_LOG(INFO, PMD, "%s: AF_PACKET MMAP parameters:\n", name);
-	RTE_LOG(INFO, PMD, "%s:\tblock size %d\n", name, blocksize);
-	RTE_LOG(INFO, PMD, "%s:\tblock count %d\n", name, blockcount);
-	RTE_LOG(INFO, PMD, "%s:\tframe size %d\n", name, framesize);
-	RTE_LOG(INFO, PMD, "%s:\tframe count %d\n", name, framecount);
-
-	if (rte_pmd_init_internals(dev, *sockfd, qpairs,
-				   blocksize, blockcount,
-				   framesize, framecount,
-				   qdisc_bypass,
-				   &internals, &eth_dev,
-				   kvlist) < 0)
-		return -1;
-
-	eth_dev->rx_pkt_burst = eth_af_packet_rx;
-	eth_dev->tx_pkt_burst = eth_af_packet_tx;
-
-	return 0;
-}
-
 static void
 parse_parameters(struct rte_kvargs *kvlist,
 		 char **if_name,
@@ -857,6 +313,168 @@ parse_parameters(struct rte_kvargs *kvlist,
 		else if (strstr(pair->key, ETH_AF_XDP_RING_SIZE_ARG) != NULL)
 			*ring_size = atoi(pair->value);
 	}
+}
+
+static struct xdp_umem *xsk_alloc_and_mem_reg_buffers(int sfd, size_t nbuffers)
+{
+	struct xdp_mr_req req = { .frame_size = FRAME_SIZE,
+				  .data_headroom = DATA_HEADROOM };
+	struct xdp_umem *umem;
+	void *bufs;
+	int ret;
+
+	ret = posix_memalign((void **)&bufs, getpagesize(),
+			     nbuffers * req.frame_size);
+	if (ret)
+		return NULL;
+
+	umem = calloc(1, sizeof(*umem));
+	if (umem == NULL) {
+		free(bufs);
+		return NULL;
+	}	
+
+	req.addr = (unsigned long)bufs;
+	req.len = nbuffers * req.frame_size;
+	ret = setsockopt(sfd, SOL_XDP, XDP_MEM_REG, &req, sizeof(req));
+	RTE_ASSERT(ret == 0);
+
+	umem->frame_size = ETH_AF_XDP_FRAME_SIZE;
+	umem->frame_size_log2 = log2(ETH_AF_XDP_FRAME_SIZE);
+	umem->buffer = bufs;
+	umem->size = nbuffers * req.frame_size;
+	umem->nframes = nbuffers;
+	umem->mr_fd = sfd;
+
+	return umem;
+}
+
+static int
+get_iface_info(const char *if_name,
+	       struct ether_addr *eth_addr,
+	       int *if_index)
+{
+	struct ifreq ifr;
+
+	int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+	if (sock < 0)
+		return -1;
+
+        strcpy(ifr.ifr_name, ifr_name);
+	if (ioctl(sock, SIOCGIFINDEX, &ifr))
+		goto error;
+	*if_index = ifr.ifr_ifindex;
+
+	if (ioctl(sock, SIOCGIFHWADDR, &ifr))
+		goto error;
+
+	memcpy(eth_addr, ifr.ifr_hwaddr.sa_data, 6);
+
+	close(sock);	
+	return 0;
+	
+error:
+	close(sock);
+	return -1;
+}
+
+static int
+init_internals(struct rte_vdev_device* dev,
+	       const char* if_name,
+	       int queue_idx,
+	       int ring_size);
+{
+	const char *name = rte_vdev_device_name(dev);
+	struct rte_eth_dev *rte_eth = NULL;
+	struct rte_eth_dev_data *data = NULL;
+	const unsigned int numa_node = dev->device.numa_node;
+	struct pmd_internals *internals;
+	sockaddr_xdp sxdp;
+	struct xdp_ring_req req;
+	struct ifreq ifr;
+	int ret;
+
+	data = rte_zmalloc_socket(name, sizeof(**internals), 0, numa_node);
+	if (data == NULL)
+		return -1;
+
+	internals = rte_zmalloc_socket(name, sizeof(*internals), 0, numa_node);
+	if (internals == NULL)
+		goto error_1;
+
+	internals->sfd = socket(PF_XDP, SOCK_RAW, 0);
+	if (internals->sfd <0)
+		goto error_2;
+
+	ret = get_iface_info(if_name, &internals->ether_addr, &internals->if_index);
+	if (ret)
+		goto error_3;
+
+	internals->umem = xsk_alloc_and_mem_reg_buffers(sfd, ETH_AF_XDP_NUM_BUFFERS);
+	if (internals->umem == NULL)
+		goto error_3;
+
+	req.mr_fd = internals->umem->mr_fd;
+	req.desc_nr = ring_size;
+
+	ret = setsockopt(sfd, SOL_XDP, XDP_RX_RING, &req, sizeof(req);
+	RTE_ASSERT(ret == 0);
+
+	ret = setsockopt(sfd, SOL_XDP, XDP_TX_RING, &req, sizeof(req);
+	RTE_ASSERT(ret == 0);
+
+	internals->rx.ring = mmap(0, req.desc_nr * sizeof(struct xdp_desc),
+				  PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_LOCKED | MAP_POPULATE,
+				  internals->sfd,
+				  XDP_PGOFF_RX_RING);
+	RTE_ASSERT(internals->rx.ring != MAP_FAILED);
+
+	internals.rx.num_free = req.desc_nr;
+	internals.rx.ring_mask = req.desc_nr - 1;
+
+	internals->tx.ring = mmap(0, req.desc_nr * sizeof(struct xdp_desc),
+				  PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_LOCKED | MAP_POPULATE,
+				  internals->sfd,
+				  XDP_PGOFF_TX_RING);
+	RTE_ASSERT(internals->tx.ring != MAP_FAILED);
+
+	internals.tx.num_free = req.desc_nr;
+	internals.tx.ring_mask = req.desc_nr - 1;
+
+	sxdp.sxdp_family = PF_XDP;
+	sxdp.sxdp_if_index = internals->if_index;
+	sxdp.sxdp_queue_id = queue_idx;
+
+	ret = bind(sfd, (struct sockaddr *)&sxdp, sizeof(sxdp));
+	RTE_ASSERT(ret == 0);
+
+	eth_dev = rte_eth_vdev_allocate(dev, 0);
+	if (eth_dev == NULL)
+		goto error_3;
+	rte_memcpy(data, (*eth_dev)->data, sizeof(*data));
+	internals->port_id = eth_dev->data->port_id;
+	data->dev_private = internals;
+	data->nb_rx_queues = 1;
+	data->nb_tx_queues = 1;
+	data->dev_link = pmd_link;
+	data->mac_addrs = &internals->eth_addr;
+
+	eth_dev->data = data;
+	eth_dev->dev_ops = &ops;
+
+	return 0;
+
+error_3:
+	close(internals->sfd);
+
+error_2:
+	rte_free(internals);
+	
+error_1:
+	rte_free(data);
+	return -1;
 }
 
 static int
