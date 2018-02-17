@@ -73,6 +73,7 @@ struct pmd_internals {
 	volatile unsigned long tx_bytes;
 
 	uint16_t port_id;
+	struct rte_ring *buf_ring;
 };
 
 static const char *valid_arguments[] = {
@@ -415,7 +416,9 @@ init_internals(struct rte_vdev_device* dev,
 	struct pmd_internals *internals;
 	struct sockaddr_xdp sxdp;
 	struct xdp_ring_req req;
+	char ring_name[0x100];
 	int ret;
+	uint64_t i;
 
 	data = rte_zmalloc_socket(name, sizeof(*internals), 0, numa_node);
 	if (data == NULL)
@@ -433,11 +436,21 @@ init_internals(struct rte_vdev_device* dev,
 	ret = get_iface_info(if_name, &internals->eth_addr, &internals->if_index);
 	if (ret)
 		goto error_3;
+	snprintf(ring_name, 0x100, "%s_%s_%d", "af_xdp_ring", if_name, queue_idx);
+	internals->buf_ring = rte_ring_create(ring_name,
+					      ETH_AF_XDP_NUM_BUFFERS,
+					      SOCKET_ID_ANY,
+					      0x0);
+	if (internals->buf_ring == NULL)
+		goto error_3;
+
+	for (i = 0; i < ETH_AF_XDP_NUM_BUFFERS; i++)
+		rte_ring_enqueue(internals->buf_ring, (void *)i);	
 
 	internals->umem = xsk_alloc_and_mem_reg_buffers(internals->sfd,
 							ETH_AF_XDP_NUM_BUFFERS);
 	if (internals->umem == NULL)
-		goto error_3;
+		goto error_4;
 
 	req.mr_fd = internals->umem->mr_fd;
 	req.desc_nr = ring_size;
@@ -493,6 +506,8 @@ init_internals(struct rte_vdev_device* dev,
 	eth_dev->tx_pkt_burst = eth_af_xdp_tx;
 
 	return 0;
+error_4:
+	rte_ring_free(internals->buf_ring);
 
 error_3:
 	close(internals->sfd);
@@ -553,6 +568,7 @@ rte_pmd_af_xdp_remove(struct rte_vdev_device *dev)
 		return -1;
 
 	internals = eth_dev->data->dev_private;
+	rte_ring_free(internals->buf_ring);
 	rte_free(internals->umem);
 	rte_free(eth_dev->data->dev_private);
 	rte_free(eth_dev->data);
