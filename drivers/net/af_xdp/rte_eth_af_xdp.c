@@ -23,6 +23,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <poll.h>
+#include "xdpsock_queue.h"
 
 #ifndef SOL_XDP
 #define SOL_XDP 283
@@ -111,10 +112,28 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	return 0;
 }
 
+static void
+fill_rx_desc(struct pmd_internals *internals)
+{
+	int num_free = internals->rx.num_free;
+	void *p=NULL;
+	int i;
+	for (i = 0; i < num_free; i++ ) {
+		struct xdp_desc desc = {};
+		rte_ring_dequeue(internals->buf_ring, &p);
+		desc.idx = (uint32_t)((uint64_t)p);
+		printf("idx = %d\n", desc.idx);
+		xq_enq(&internals->rx, &desc, 1);
+	}
+}
+
 static int
 eth_dev_start(struct rte_eth_dev *dev)
 {
+	struct pmd_internals *internals = dev->data->dev_private;
 	dev->data->dev_link.link_status = ETH_LINK_UP;
+	fill_rx_desc(internals);
+
 	return 0;
 }
 
