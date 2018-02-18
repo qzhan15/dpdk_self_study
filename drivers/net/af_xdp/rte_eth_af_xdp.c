@@ -48,6 +48,7 @@
 #define ETH_AF_XDP_DFLT_QUEUE_IDX	0
 
 #define ETH_AF_XDP_RX_BATCH_SIZE	32
+#define ETH_AF_XDP_TX_BATCH_SIZE	32
 
 struct xdp_umem {
 	char *buffer;
@@ -102,6 +103,8 @@ static void *get_pkt_data(struct pmd_internals *internals,
 			   (index << internals->umem->frame_size_log2) +
 			   offset);
 }
+
+#if 0
 static void hex_dump(void *pkt, size_t length, const char *prefix)
 {
 	int i = 0;
@@ -131,6 +134,7 @@ static void hex_dump(void *pkt, size_t length, const char *prefix)
 	}
 	printf("\n");
 }
+#endif
 
 static uint16_t
 eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
@@ -141,7 +145,6 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	unsigned long dropped = 0;
 	unsigned long rx_bytes = 0;
 	uint16_t count = 0;
-	(void)bufs;
 	nb_pkts = nb_pkts < ETH_AF_XDP_RX_BATCH_SIZE ?
 		  nb_pkts : ETH_AF_XDP_RX_BATCH_SIZE;
 
@@ -156,7 +159,7 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 					      NULL);
 		for (i = 0; i < n; i++)
 			descs[i].idx = (uint32_t)((long int)indexes[i]);
-		xq_enq(&internals->rx, descs, n);
+		xq_enq(rxq, descs, n);
 	}
 
 	/* read data */
@@ -166,7 +169,7 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 
 	for (i = 0; i < rcvd; i++) {
 		char *pkt;
-		char buf[32];
+		//char buf[32];
 		uint32_t idx = descs[i].idx;
 		mbuf = rte_pktmbuf_alloc(internals->mb_pool);
 		rte_pktmbuf_pkt_len(mbuf) =
@@ -174,8 +177,8 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 			descs[i].len;
 		if (mbuf) {
 			pkt = get_pkt_data(internals, idx, descs[i].offset);
-			sprintf(buf, "idx=%d\n", idx);
-			hex_dump(pkt, descs[i].len, buf);
+			//sprintf(buf, "idx=%d\n", idx);
+			//hex_dump(pkt, descs[i].len, buf);
 			memcpy(rte_pktmbuf_mtod(mbuf, void *), pkt, descs[i].len);
 			rx_bytes += descs[i].len;
 			bufs[count++] = mbuf;
@@ -194,13 +197,75 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	return count;
 }
 
+static void kick_tx(int fd)
+{
+	int ret;
+
+	for (;;) {
+		ret = sendto(fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+		if (ret >= 0 || errno == ENOBUFS)
+			return;
+		if (errno == EAGAIN)
+			continue;
+	}
+}
+
 static uint16_t
 eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
-	(void)queue;
-	(void)bufs;
-	(void)nb_pkts;
-	return 0;
+	struct pmd_internals *internals = queue;
+	struct xdp_queue *txq = &internals->tx;
+	struct rte_mbuf *mbuf;
+	struct xdp_desc descs[ETH_AF_XDP_TX_BATCH_SIZE];
+	void *indexes[ETH_AF_XDP_TX_BATCH_SIZE];
+	uint16_t i, valid;
+	unsigned long tx_bytes = 0;
+
+
+	nb_pkts = nb_pkts < ETH_AF_XDP_TX_BATCH_SIZE ?
+		  nb_pkts : ETH_AF_XDP_TX_BATCH_SIZE;
+
+	if (txq->num_free < ETH_AF_XDP_TX_BATCH_SIZE*4) {
+		printf("num_free = %d\n", txq->num_free);
+		int n = xq_deq(txq, descs, ETH_AF_XDP_TX_BATCH_SIZE);
+		for (i = 0; i < n; i++)
+			indexes[i] = (void *)((long int)descs[i].idx);
+		rte_ring_enqueue_bulk(internals->buf_ring, indexes, n, NULL);
+		printf("num_free = %d\n", txq->num_free);
+	}
+	
+	nb_pkts = nb_pkts > txq->num_free ? txq->num_free : nb_pkts;
+	nb_pkts = rte_ring_dequeue_bulk(internals->buf_ring, indexes, nb_pkts, NULL);
+
+	valid = 0;
+	for (i = 0; i < nb_pkts; i++) {
+		char *pkt;
+		mbuf = bufs[i];
+		printf("pkt_len = %d\n", mbuf->pkt_len);
+		if (mbuf->pkt_len <= (internals->umem->frame_size - ETH_AF_XDP_DATA_HEADROOM)) {
+			descs[valid].idx = (uint32_t)((long int)indexes[valid]);
+			descs[valid].offset = ETH_AF_XDP_DATA_HEADROOM;
+			descs[valid].flags = 0;
+			descs[valid].len = mbuf->pkt_len;
+			pkt = get_pkt_data(internals, descs[i].idx, descs[i].offset);
+			memcpy(pkt, rte_pktmbuf_mtod(mbuf, void *), descs[i].len);
+			valid++;
+			tx_bytes += mbuf->pkt_len;
+		}
+		rte_pktmbuf_free(mbuf);
+	}
+
+	xq_enq(txq, descs, valid);
+	kick_tx(internals->sfd);
+
+	if (valid < nb_pkts)
+		rte_ring_enqueue_bulk(internals->buf_ring, &indexes[valid], nb_pkts-valid, NULL);
+	
+	internals->err_pkts += (nb_pkts - valid);
+	internals->tx_pkts += valid;
+	internals->tx_bytes += tx_bytes;
+
+	return valid;
 }
 
 static void
