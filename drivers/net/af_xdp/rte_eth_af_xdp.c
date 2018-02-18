@@ -70,6 +70,7 @@ struct pmd_internals {
 
 	volatile unsigned long rx_pkts;
 	volatile unsigned long rx_bytes;
+	volatile unsigned long rx_dropped;
 
 	volatile unsigned long tx_pkts;
 	volatile unsigned long err_pkts;
@@ -136,6 +137,10 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
 	struct pmd_internals *internals = queue;
 	struct xdp_queue *rxq = &internals->rx;
+	struct rte_mbuf *mbuf;
+	unsigned long dropped = 0;
+	unsigned long rx_bytes = 0;
+	uint16_t count = 0;
 	(void)bufs;
 	nb_pkts = nb_pkts < ETH_AF_XDP_RX_BATCH_SIZE ?
 		  nb_pkts : ETH_AF_XDP_RX_BATCH_SIZE;
@@ -163,20 +168,32 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		char *pkt;
 		char buf[32];
 		uint32_t idx = descs[i].idx;
+		mbuf = rte_pktmbuf_alloc(internals->mb_pool);
+		rte_pktmbuf_pkt_len(mbuf) =
+			rte_pktmbuf_data_len(mbuf) =
+			descs[i].len;
+		if (mbuf) {
+			pkt = get_pkt_data(internals, idx, descs[i].offset);
+			sprintf(buf, "idx=%d\n", idx);
+			hex_dump(pkt, descs[i].len, buf);
+			memcpy(rte_pktmbuf_mtod(mbuf, void *), pkt, descs[i].len);
+			rx_bytes += descs[i].len;
+			bufs[count++] = mbuf;
+		} else {
+			dropped++;
+		}
 		indexes[i] = (void *)((long int)idx);
-		pkt = get_pkt_data(internals, idx, descs[i].offset);
-		(void)pkt;
-		sprintf(buf, "idx=%d\n", idx);
-		hex_dump(pkt, descs[i].len, buf);
 	}
 
 	rte_ring_enqueue_bulk(internals->buf_ring, indexes, rcvd, NULL);
-	return 0;
+
+	internals->rx_pkts += (rcvd-dropped);
+	internals->rx_bytes += rx_bytes;
+	internals->rx_dropped += dropped;
+
+	return count;
 }
 
-/*
- * Callback to handle sending packets through a real NIC.
- */
 static uint16_t
 eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
@@ -248,6 +265,8 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 		internal->rx_pkts;
 	stats->ibytes = stats->q_ibytes[0] =
 		internal->rx_bytes;
+	stats->imissed =
+		internal->rx_dropped;
 
 	stats->opackets = stats->q_opackets[0]
 		= internal->tx_pkts;
@@ -266,6 +285,7 @@ eth_stats_reset(struct rte_eth_dev *dev)
 
 	internal->rx_pkts = 0;
 	internal->rx_bytes = 0;
+	internal->rx_dropped = 0;
 
 	internal->tx_pkts = 0;
 	internal->err_pkts = 0;
