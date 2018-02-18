@@ -47,6 +47,8 @@
 #define ETH_AF_XDP_DFLT_RING_SIZE	1024
 #define ETH_AF_XDP_DFLT_QUEUE_IDX	0
 
+#define ETH_AF_XDP_RX_BATCH_SIZE	32
+
 struct xdp_umem {
 	char *buffer;
 	size_t size;
@@ -91,12 +93,84 @@ static struct rte_eth_link pmd_link = {
 	.link_autoneg = ETH_LINK_AUTONEG
 };
 
+static void *get_pkt_data(struct pmd_internals *internals,
+			  uint32_t index,
+			  uint32_t offset)
+{
+	return (uint8_t *)(internals->umem->buffer +
+			   (index << internals->umem->frame_size_log2) +
+			   offset);
+}
+static void hex_dump(void *pkt, size_t length, const char *prefix)
+{
+	int i = 0;
+	const unsigned char *address = (unsigned char *)pkt;
+	const unsigned char *line = address;
+	size_t line_size = 32;
+	unsigned char c;
+
+	printf("length = %zu\n", length);
+	printf("%s | ", prefix);
+	while (length-- > 0) {
+		printf("%02X ", *address++);
+		if (!(++i % line_size) || (length == 0 && i % line_size)) {
+			if (length == 0) {
+				while (i++ % line_size)
+					printf("__ ");
+			}
+			printf(" | ");  /* right close */
+			while (line < address) {
+				c = *line++;
+				printf("%c", (c < 33 || c == 255) ? 0x2E : c);
+			}
+			printf("\n");
+			if (length > 0)
+				printf("%s | ", prefix);
+		}
+	}
+	printf("\n");
+}
+
 static uint16_t
 eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
-	(void)queue;
+	struct pmd_internals *internals = queue;
+	struct xdp_queue *rxq = &internals->rx;
 	(void)bufs;
-	(void)nb_pkts;
+	nb_pkts = nb_pkts < ETH_AF_XDP_RX_BATCH_SIZE ?
+		  nb_pkts : ETH_AF_XDP_RX_BATCH_SIZE;
+
+	struct xdp_desc descs[ETH_AF_XDP_RX_BATCH_SIZE];
+	void *indexes[ETH_AF_XDP_RX_BATCH_SIZE];
+	int rcvd, i;
+	/* fill rx ring */
+	if (rxq->num_free >= ETH_AF_XDP_RX_BATCH_SIZE) {
+		int n = rte_ring_dequeue_bulk(internals->buf_ring,
+					      indexes,
+					      ETH_AF_XDP_RX_BATCH_SIZE,
+					      NULL);
+		for (i = 0; i < n; i++)
+			descs[i].idx = (uint32_t)((long int)indexes[i]);
+		xq_enq(&internals->rx, descs, n);
+	}
+
+	/* read data */
+	rcvd = xq_deq(rxq, descs, nb_pkts);
+	if (rcvd == 0)
+		return 0;
+
+	for (i = 0; i < rcvd; i++) {
+		char *pkt;
+		char buf[32];
+		uint32_t idx = descs[i].idx;
+		indexes[i] = (void *)((long int)idx);
+		pkt = get_pkt_data(internals, idx, descs[i].offset);
+		(void)pkt;
+		sprintf(buf, "idx=%d\n", idx);
+		hex_dump(pkt, descs[i].len, buf);
+	}
+
+	rte_ring_enqueue_bulk(internals->buf_ring, indexes, rcvd, NULL);
 	return 0;
 }
 
@@ -121,7 +195,7 @@ fill_rx_desc(struct pmd_internals *internals)
 	for (i = 0; i < num_free; i++ ) {
 		struct xdp_desc desc = {};
 		rte_ring_dequeue(internals->buf_ring, &p);
-		desc.idx = (uint32_t)((uint64_t)p);
+		desc.idx = (uint32_t)((long int)p);
 		printf("idx = %d\n", desc.idx);
 		xq_enq(&internals->rx, &desc, 1);
 	}
@@ -437,7 +511,7 @@ init_internals(struct rte_vdev_device* dev,
 	struct xdp_ring_req req;
 	char ring_name[0x100];
 	int ret;
-	uint64_t i;
+	long int i;
 
 	data = rte_zmalloc_socket(name, sizeof(*internals), 0, numa_node);
 	if (data == NULL)
