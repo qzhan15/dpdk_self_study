@@ -226,12 +226,10 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		  nb_pkts : ETH_AF_XDP_TX_BATCH_SIZE;
 
 	if (txq->num_free < ETH_AF_XDP_TX_BATCH_SIZE*4) {
-		printf("num_free = %d\n", txq->num_free);
 		int n = xq_deq(txq, descs, ETH_AF_XDP_TX_BATCH_SIZE);
 		for (i = 0; i < n; i++)
 			indexes[i] = (void *)((long int)descs[i].idx);
 		rte_ring_enqueue_bulk(internals->buf_ring, indexes, n, NULL);
-		printf("num_free = %d\n", txq->num_free);
 	}
 	
 	nb_pkts = nb_pkts > txq->num_free ? txq->num_free : nb_pkts;
@@ -241,7 +239,6 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	for (i = 0; i < nb_pkts; i++) {
 		char *pkt;
 		mbuf = bufs[i];
-		printf("pkt_len = %d\n", mbuf->pkt_len);
 		if (mbuf->pkt_len <= (internals->umem->frame_size - ETH_AF_XDP_DATA_HEADROOM)) {
 			descs[valid].idx = (uint32_t)((long int)indexes[valid]);
 			descs[valid].offset = ETH_AF_XDP_DATA_HEADROOM;
@@ -278,7 +275,6 @@ fill_rx_desc(struct pmd_internals *internals)
 		struct xdp_desc desc = {};
 		rte_ring_dequeue(internals->buf_ring, &p);
 		desc.idx = (uint32_t)((long int)p);
-		printf("idx = %d\n", desc.idx);
 		xq_enq(&internals->rx, &desc, 1);
 	}
 }
