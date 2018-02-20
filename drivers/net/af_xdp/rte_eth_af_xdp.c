@@ -43,7 +43,7 @@
 
 #define ETH_AF_XDP_FRAME_SIZE		2048
 #define ETH_AF_XDP_NUM_BUFFERS		131072
-#define ETH_AF_XDP_DATA_HEADROOM	192
+#define ETH_AF_XDP_DATA_HEADROOM	320
 #define ETH_AF_XDP_DFLT_RING_SIZE	1024
 #define ETH_AF_XDP_DFLT_QUEUE_IDX	0
 
@@ -56,7 +56,6 @@ struct xdp_umem {
 	unsigned int frame_size;
 	unsigned int frame_size_log2;
 	unsigned int nframes;
-	int mr_fd;
 	struct rte_mempool *mb_pool;
 };
 
@@ -69,6 +68,7 @@ struct pmd_internals {
 	struct xdp_queue tx;
 	struct xdp_umem *umem;
 	struct rte_mempool *ext_mb_pool;
+	uint8_t share_mb_pool;
 
 	volatile unsigned long rx_pkts;
 	volatile unsigned long rx_bytes;
@@ -192,22 +192,31 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		char *pkt;
 		//char buf[32];
 		uint32_t idx = descs[i].idx;
-		mbuf = rte_pktmbuf_alloc(internals->ext_mb_pool);
-		rte_pktmbuf_pkt_len(mbuf) =
-			rte_pktmbuf_data_len(mbuf) =
-			descs[i].len;
-		if (mbuf) {
-			pkt = get_pkt_data(internals, idx, descs[i].offset);
-			//sprintf(buf, "idx=%d\n", idx);
-			//hex_dump(pkt, descs[i].len, buf);
-			memcpy(rte_pktmbuf_mtod(mbuf, void *), pkt, descs[i].len);
-			rx_bytes += descs[i].len;
-			bufs[count++] = mbuf;
+		if (!internals->share_mb_pool) {
+			mbuf = rte_pktmbuf_alloc(internals->ext_mb_pool);
+			rte_pktmbuf_pkt_len(mbuf) =
+				rte_pktmbuf_data_len(mbuf) =
+				descs[i].len;
+			if (mbuf) {
+				pkt = get_pkt_data(internals, idx, descs[i].offset);
+				//sprintf(buf, "idx=%d\n", idx);
+				//hex_dump(pkt, descs[i].len, buf);
+				memcpy(rte_pktmbuf_mtod(mbuf, void *), pkt, descs[i].len);
+				rx_bytes += descs[i].len;
+				bufs[count++] = mbuf;
+			} else {
+				dropped++;
+			}
+			rte_pktmbuf_free(idx_to_mbuf(internals, idx));
+			internals->mbuf_free_count++;
 		} else {
-			dropped++;
+			mbuf = idx_to_mbuf(internals, idx);
+			rte_pktmbuf_pkt_len(mbuf) =
+				rte_pktmbuf_data_len(mbuf) =
+				descs[i].len;
+			bufs[count++] = mbuf;
+			rx_bytes += descs[i].len;
 		}
-		rte_pktmbuf_free(idx_to_mbuf(internals, idx));
-		internals->mbuf_free_count++;
 	}
 
 	internals->rx_pkts += (rcvd-dropped);
@@ -241,6 +250,7 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	uint16_t i, valid;
 	unsigned long tx_bytes = 0;
 	int ret;
+	uint8_t share_mempool = 0;
 
 	nb_pkts = nb_pkts < ETH_AF_XDP_TX_BATCH_SIZE ?
 		  nb_pkts : ETH_AF_XDP_TX_BATCH_SIZE;
@@ -253,37 +263,56 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	}
 	
 	nb_pkts = nb_pkts > txq->num_free ? txq->num_free : nb_pkts;
-	ret = rte_mempool_get_bulk(internals->umem->mb_pool,
-				   (void *)mbufs,
-				   nb_pkts);
-	if (ret)
+	if (nb_pkts == 0)
 		return 0;
-	internals->mbuf_alloc_count+= nb_pkts;
+
+	if (bufs[0]->pool == internals->ext_mb_pool && internals->share_mb_pool)
+		share_mempool = 1;
+
+	if (!share_mempool) {
+		ret = rte_mempool_get_bulk(internals->umem->mb_pool,
+					   (void *)mbufs,
+					   nb_pkts);
+		if (ret)
+			return 0;
+		internals->mbuf_alloc_count+= nb_pkts;
+	}
 
 	valid = 0;
 	for (i = 0; i < nb_pkts; i++) {
 		char *pkt;
 		mbuf = bufs[i];
-		if (mbuf->pkt_len <= (internals->umem->frame_size - ETH_AF_XDP_DATA_HEADROOM)) {
-			descs[valid].idx = mbuf_to_idx(internals, mbufs[i]);
-			descs[valid].offset = ETH_AF_XDP_DATA_HEADROOM;
-			descs[valid].flags = 0;
-			descs[valid].len = mbuf->pkt_len;
-			pkt = get_pkt_data(internals, descs[i].idx, descs[i].offset);
-			memcpy(pkt, rte_pktmbuf_mtod(mbuf, void *), descs[i].len);
-			valid++;
+		if (!share_mempool) {
+			if (mbuf->pkt_len <= (internals->umem->frame_size - ETH_AF_XDP_DATA_HEADROOM)) {
+				descs[valid].idx = mbuf_to_idx(internals, mbufs[i]);
+				descs[valid].offset = ETH_AF_XDP_DATA_HEADROOM;
+				descs[valid].flags = 0;
+				descs[valid].len = mbuf->pkt_len;
+				pkt = get_pkt_data(internals, descs[i].idx, descs[i].offset);
+				memcpy(pkt, rte_pktmbuf_mtod(mbuf, void *), descs[i].len);
+				valid++;
+				tx_bytes += mbuf->pkt_len;
+			}
+			rte_pktmbuf_free(mbuf);
+		} else {
+			descs[i].idx = mbuf_to_idx(internals, mbuf);
+			descs[i].offset = ETH_AF_XDP_DATA_HEADROOM;
+			descs[i].flags = 0;
+			descs[i].len = mbuf->pkt_len;
 			tx_bytes += mbuf->pkt_len;
+			valid++;
 		}
-		rte_pktmbuf_free(mbuf);
 	}
 
 	xq_enq(txq, descs, valid);
 	kick_tx(internals->sfd);
 
-	if (valid < nb_pkts) {
-		for (i = valid; i < nb_pkts; i++)
-			rte_pktmbuf_free(mbufs[i]);
-		internals->mbuf_free_count += (nb_pkts-valid);
+	if (!share_mempool) {
+		if (valid < nb_pkts) {
+			for (i = valid; i < nb_pkts; i++)
+				rte_pktmbuf_free(mbufs[i]);
+			internals->mbuf_free_count += (nb_pkts-valid);
+		}
 	}
 
 	internals->err_pkts += (nb_pkts - valid);
@@ -416,7 +445,7 @@ static void dump_mempool(struct rte_mempool *mb_pool)
 	struct rte_mbuf *mbuf1, *mbuf2;
 	printf("flags = %x\n", mb_pool->flags);
 	printf("size = %d\n", mb_pool->size);
-
+	printf("populated_size = %d\n", mb_pool->populated_size);
 	printf("elt_size = %d\n", mb_pool->elt_size);
 	printf("header_size = %d\n", mb_pool->header_size);
 	printf("trailer_size = %d\n", mb_pool->trailer_size);
@@ -435,45 +464,78 @@ static void dump_mempool(struct rte_mempool *mb_pool)
 	rte_pktmbuf_free(mbuf2);
 }
 
-static struct xdp_umem *xsk_alloc_and_mem_reg_buffers(int sfd,
-						      size_t nbuffers,
-						      const char *pool_name)
+static uint8_t
+check_mempool(struct rte_mempool *mp )
+{
+	RTE_ASSERT(mp);
+
+	/* must continues */
+	if (mp->nb_mem_chunks > 1)
+		return 0;
+
+	/* check base address */
+	if ((uint64_t)get_base_addr(mp) % getpagesize() != 0)
+		return 0;
+
+	/* check chunk size */
+	if ((mp->elt_size + mp->header_size + mp->trailer_size) %
+			ETH_AF_XDP_FRAME_SIZE != 0)
+		return 0;
+
+	return 1;
+}
+
+static struct xdp_umem *
+xsk_alloc_and_mem_reg_buffers(struct pmd_internals *internals)
 {
 	struct xdp_mr_req req = { .frame_size = ETH_AF_XDP_FRAME_SIZE,
 				  .data_headroom = ETH_AF_XDP_DATA_HEADROOM };
+	char pool_name[0x100];
+	int nbuffers;
+
 	struct xdp_umem *umem =calloc(1, sizeof(*umem));
 	if (umem == NULL) {
 		return NULL;
 	}
 
-	umem->mb_pool =
-		rte_pktmbuf_pool_create_no_spread(pool_name, nbuffers,
-						  250, 0,
-						  (ETH_AF_XDP_FRAME_SIZE-192),
-						  SOCKET_ID_ANY);
-	if (umem->mb_pool == NULL) {
-		free(umem);
-		return NULL;
-	}
+	internals->share_mb_pool = check_mempool(internals->ext_mb_pool);
+	if (!internals->share_mb_pool) {
+		printf("use local mempool\n");
+		snprintf(pool_name, 0x100, "%s_%s_%d", "af_xdp_pool",
+			 internals->if_name, internals->queue_idx);
+		umem->mb_pool =
+			rte_pktmbuf_pool_create_no_spread(pool_name, ETH_AF_XDP_NUM_BUFFERS,
+							  250, 0,
+							  (ETH_AF_XDP_FRAME_SIZE-192),
+							  SOCKET_ID_ANY);
+		if (umem->mb_pool == NULL) {
+			free(umem);
+			return NULL;
+		}
 
-	if (umem->mb_pool->nb_mem_chunks > 1) {
-		rte_mempool_free(umem->mb_pool);
-		free(umem);
-		return NULL;
-	}
+		if (umem->mb_pool->nb_mem_chunks > 1) {
+			rte_mempool_free(umem->mb_pool);
+			free(umem);
+			return NULL;
+		}
 
-	dump_mempool(umem->mb_pool);
+		dump_mempool(umem->mb_pool);
+		nbuffers = ETH_AF_XDP_NUM_BUFFERS;
+	} else {
+		printf("use share mempool\n");
+		umem->mb_pool = internals->ext_mb_pool;
+		nbuffers = umem->mb_pool->populated_size;
+	}
 
 	req.addr = (uint64_t)get_base_addr(umem->mb_pool);
-	req.len = nbuffers * req.frame_size;
-	setsockopt(sfd, SOL_XDP, XDP_MEM_REG, &req, sizeof(req));
+	req.len = ETH_AF_XDP_NUM_BUFFERS * req.frame_size;
+	setsockopt(internals->sfd, SOL_XDP, XDP_MEM_REG, &req, sizeof(req));
 
 	umem->frame_size = ETH_AF_XDP_FRAME_SIZE;
 	umem->frame_size_log2 = 11;
 	umem->buffer = (char *)req.addr;
-	umem->size = nbuffers * req.frame_size;
+	umem->size = nbuffers* req.frame_size;
 	umem->nframes = nbuffers;
-	umem->mr_fd = sfd;
 
 	return umem;
 }
@@ -483,19 +545,14 @@ xdp_configure(struct pmd_internals *internals)
 {
 	struct sockaddr_xdp sxdp;
 	struct xdp_ring_req req;
-	char pool_name[0x100];
 
 	int ret = 0;
 
-	snprintf(pool_name, 0x100, "%s_%s_%d", "af_xdp_pool",
-		  internals->if_name, internals->queue_idx);
-	internals->umem = xsk_alloc_and_mem_reg_buffers(internals->sfd,
-							ETH_AF_XDP_NUM_BUFFERS,
-							pool_name);
+	internals->umem = xsk_alloc_and_mem_reg_buffers(internals);
 	if (internals->umem == NULL)
 		return -1;
 
-	req.mr_fd = internals->umem->mr_fd;
+	req.mr_fd = internals->sfd;
 	req.desc_nr = internals->ring_size;
 
 	ret = setsockopt(internals->sfd, SOL_XDP, XDP_RX_RING, &req, sizeof(req));
@@ -555,7 +612,7 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
 		RTE_PKTMBUF_HEADROOM;
 	data_size = internals->umem->frame_size;
 
-	if (data_size > buf_size) {
+	if (data_size - ETH_AF_XDP_DATA_HEADROOM > buf_size) {
 		RTE_LOG(ERR, PMD,
 			"%s: %d bytes will not fit in mbuf (%d bytes)\n",
 			dev->device->name, data_size, buf_size);
@@ -821,7 +878,7 @@ rte_pmd_af_xdp_remove(struct rte_vdev_device *dev)
 
 	internals = eth_dev->data->dev_private;
 	if (internals->umem) {
-		if (internals->umem->mb_pool)
+		if (internals->umem->mb_pool && !internals->share_mb_pool)
 			rte_mempool_free(internals->umem->mb_pool);
 		rte_free(internals->umem);
 	}
