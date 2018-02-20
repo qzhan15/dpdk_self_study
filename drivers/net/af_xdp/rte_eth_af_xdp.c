@@ -43,7 +43,7 @@
 
 #define ETH_AF_XDP_FRAME_SIZE		2048
 #define ETH_AF_XDP_NUM_BUFFERS		131072
-#define ETH_AF_XDP_DATA_HEADROOM	192
+#define ETH_AF_XDP_DATA_HEADROOM	320
 #define ETH_AF_XDP_DFLT_RING_SIZE	1024
 #define ETH_AF_XDP_DFLT_QUEUE_IDX	0
 
@@ -592,7 +592,7 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
 		RTE_PKTMBUF_HEADROOM;
 	data_size = internals->umem->frame_size;
 
-	if (data_size > buf_size) {
+	if (data_size - ETH_AF_XDP_DATA_HEADROOM > buf_size) {
 		RTE_LOG(ERR, PMD,
 			"%s: %d bytes will not fit in mbuf (%d bytes)\n",
 			dev->device->name, data_size, buf_size);
