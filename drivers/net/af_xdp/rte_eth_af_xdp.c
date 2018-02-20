@@ -250,6 +250,7 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	uint16_t i, valid;
 	unsigned long tx_bytes = 0;
 	int ret;
+	uint8_t share_mempool = 0;
 
 	nb_pkts = nb_pkts < ETH_AF_XDP_TX_BATCH_SIZE ?
 		  nb_pkts : ETH_AF_XDP_TX_BATCH_SIZE;
@@ -262,37 +263,56 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	}
 	
 	nb_pkts = nb_pkts > txq->num_free ? txq->num_free : nb_pkts;
-	ret = rte_mempool_get_bulk(internals->umem->mb_pool,
-				   (void *)mbufs,
-				   nb_pkts);
-	if (ret)
+	if (nb_pkts == 0)
 		return 0;
-	internals->mbuf_alloc_count+= nb_pkts;
+
+	if (bufs[0]->pool == internals->ext_mb_pool && internals->share_mb_pool)
+		share_mempool = 1;
+
+	if (!share_mempool) {
+		ret = rte_mempool_get_bulk(internals->umem->mb_pool,
+					   (void *)mbufs,
+					   nb_pkts);
+		if (ret)
+			return 0;
+		internals->mbuf_alloc_count+= nb_pkts;
+	}
 
 	valid = 0;
 	for (i = 0; i < nb_pkts; i++) {
 		char *pkt;
 		mbuf = bufs[i];
-		if (mbuf->pkt_len <= (internals->umem->frame_size - ETH_AF_XDP_DATA_HEADROOM)) {
-			descs[valid].idx = mbuf_to_idx(internals, mbufs[i]);
-			descs[valid].offset = ETH_AF_XDP_DATA_HEADROOM;
-			descs[valid].flags = 0;
-			descs[valid].len = mbuf->pkt_len;
-			pkt = get_pkt_data(internals, descs[i].idx, descs[i].offset);
-			memcpy(pkt, rte_pktmbuf_mtod(mbuf, void *), descs[i].len);
-			valid++;
+		if (!share_mempool) {
+			if (mbuf->pkt_len <= (internals->umem->frame_size - ETH_AF_XDP_DATA_HEADROOM)) {
+				descs[valid].idx = mbuf_to_idx(internals, mbufs[i]);
+				descs[valid].offset = ETH_AF_XDP_DATA_HEADROOM;
+				descs[valid].flags = 0;
+				descs[valid].len = mbuf->pkt_len;
+				pkt = get_pkt_data(internals, descs[i].idx, descs[i].offset);
+				memcpy(pkt, rte_pktmbuf_mtod(mbuf, void *), descs[i].len);
+				valid++;
+				tx_bytes += mbuf->pkt_len;
+			}
+			rte_pktmbuf_free(mbuf);
+		} else {
+			descs[i].idx = mbuf_to_idx(internals, mbuf);
+			descs[i].offset = ETH_AF_XDP_DATA_HEADROOM;
+			descs[i].flags = 0;
+			descs[i].len = mbuf->pkt_len;
 			tx_bytes += mbuf->pkt_len;
+			valid++;
 		}
-		rte_pktmbuf_free(mbuf);
 	}
 
 	xq_enq(txq, descs, valid);
 	kick_tx(internals->sfd);
 
-	if (valid < nb_pkts) {
-		for (i = valid; i < nb_pkts; i++)
-			rte_pktmbuf_free(mbufs[i]);
-		internals->mbuf_free_count += (nb_pkts-valid);
+	if (!share_mempool) {
+		if (valid < nb_pkts) {
+			for (i = valid; i < nb_pkts; i++)
+				rte_pktmbuf_free(mbufs[i]);
+			internals->mbuf_free_count += (nb_pkts-valid);
+		}
 	}
 
 	internals->err_pkts += (nb_pkts - valid);
