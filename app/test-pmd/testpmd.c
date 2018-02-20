@@ -518,8 +518,8 @@ mbuf_pool_create(uint16_t mbuf_seg_size, unsigned nb_mbuf,
 		/* wrapper to rte_mempool_create() */
 		TESTPMD_LOG(INFO, "preferred mempool ops selected: %s\n",
 				rte_mbuf_best_mempool_ops());
-		rte_mp = rte_pktmbuf_pool_create(pool_name, nb_mbuf,
-			mb_mempool_cache, 0, mbuf_seg_size, socket_id);
+		rte_mp = rte_pktmbuf_pool_create_no_spread(pool_name, nb_mbuf,
+			mb_mempool_cache, 0, 2048-192, socket_id);
 	}
 
 err:
