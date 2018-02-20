@@ -43,7 +43,7 @@
 
 #define ETH_AF_XDP_FRAME_SIZE		2048
 #define ETH_AF_XDP_NUM_BUFFERS		131072
-#define ETH_AF_XDP_DATA_HEADROOM	0
+#define ETH_AF_XDP_DATA_HEADROOM	192
 #define ETH_AF_XDP_DFLT_RING_SIZE	1024
 #define ETH_AF_XDP_DFLT_QUEUE_IDX	0
 
@@ -57,6 +57,7 @@ struct xdp_umem {
 	unsigned int frame_size_log2;
 	unsigned int nframes;
 	int mr_fd;
+	struct rte_mempool *mb_pool;
 };
 
 struct pmd_internals {
@@ -67,7 +68,7 @@ struct pmd_internals {
 	struct xdp_queue rx;
 	struct xdp_queue tx;
 	struct xdp_umem *umem;
-	struct rte_mempool *mb_pool;
+	struct rte_mempool *ext_mb_pool;
 
 	volatile unsigned long rx_pkts;
 	volatile unsigned long rx_bytes;
@@ -173,7 +174,7 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		char *pkt;
 		//char buf[32];
 		uint32_t idx = descs[i].idx;
-		mbuf = rte_pktmbuf_alloc(internals->mb_pool);
+		mbuf = rte_pktmbuf_alloc(internals->ext_mb_pool);
 		rte_pktmbuf_pkt_len(mbuf) =
 			rte_pktmbuf_data_len(mbuf) =
 			descs[i].len;
@@ -372,33 +373,74 @@ eth_link_update(struct rte_eth_dev *dev __rte_unused,
 	return 0;
 }
 
-static struct xdp_umem *xsk_alloc_and_mem_reg_buffers(int sfd, size_t nbuffers)
+static void *get_base_addr(struct rte_mempool *mb_pool)
+{
+	struct rte_mempool_memhdr *memhdr;
+	STAILQ_FOREACH(memhdr, &mb_pool->mem_list, next) {
+		return memhdr->addr;
+	}
+	return NULL;
+}
+
+static void dump_mempool(struct rte_mempool *mb_pool)
+{
+	struct rte_mempool_memhdr *memhdr;
+	struct rte_mbuf *mbuf1, *mbuf2;
+	printf("flags = %x\n", mb_pool->flags);
+	printf("size = %d\n", mb_pool->size);
+
+	printf("elt_size = %d\n", mb_pool->elt_size);
+	printf("header_size = %d\n", mb_pool->header_size);
+	printf("trailer_size = %d\n", mb_pool->trailer_size);
+	printf("nb_mem_chunk = %d\n", mb_pool->nb_mem_chunks);
+	printf("private_data_size = %d\n", mb_pool->private_data_size);
+	STAILQ_FOREACH(memhdr, &mb_pool->mem_list, next) {
+		printf("base addr = %lx\n", (uint64_t)memhdr->addr);;
+	}
+	mbuf1 = rte_pktmbuf_alloc(mb_pool);
+	printf("mbuf->addr = %lx\n", (uint64_t)mbuf1->buf_addr);
+	mbuf2 = rte_pktmbuf_alloc(mb_pool);
+	printf("mbuf->addr = %lx\n", (uint64_t)mbuf2->buf_addr);
+	rte_pktmbuf_free(mbuf1);
+	rte_pktmbuf_free(mbuf2);
+}
+
+static struct xdp_umem *xsk_alloc_and_mem_reg_buffers(int sfd,
+						      size_t nbuffers,
+						      const char *pool_name)
 {
 	struct xdp_mr_req req = { .frame_size = ETH_AF_XDP_FRAME_SIZE,
 				  .data_headroom = ETH_AF_XDP_DATA_HEADROOM };
-	struct xdp_umem *umem;
-	void *bufs;
-	int ret;
-
-	ret = posix_memalign((void **)&bufs, getpagesize(),
-			     nbuffers * req.frame_size);
-	if (ret)
-		return NULL;
-
-	umem = calloc(1, sizeof(*umem));
+	struct xdp_umem *umem =calloc(1, sizeof(*umem));
 	if (umem == NULL) {
-		free(bufs);
 		return NULL;
 	}
 
-	req.addr = (unsigned long)bufs;
+	umem->mb_pool =
+		rte_pktmbuf_pool_create_no_spread(pool_name, nbuffers,
+						  250, 0,
+						  (ETH_AF_XDP_FRAME_SIZE-192),
+						  SOCKET_ID_ANY);
+	if (umem->mb_pool == NULL) {
+		free(umem);
+		return NULL;
+	}
+
+	if (umem->mb_pool->nb_mem_chunks > 1) {
+		rte_mempool_free(umem->mb_pool);
+		free(umem);
+		return NULL;
+	}
+
+	dump_mempool(umem->mb_pool);
+
+	req.addr = (uint64_t)get_base_addr(umem->mb_pool);
 	req.len = nbuffers * req.frame_size;
-	ret = setsockopt(sfd, SOL_XDP, XDP_MEM_REG, &req, sizeof(req));
-	RTE_ASSERT(ret == 0);
+	setsockopt(sfd, SOL_XDP, XDP_MEM_REG, &req, sizeof(req));
 
 	umem->frame_size = ETH_AF_XDP_FRAME_SIZE;
 	umem->frame_size_log2 = 11;
-	umem->buffer = bufs;
+	umem->buffer = (char *)req.addr;
 	umem->size = nbuffers * req.frame_size;
 	umem->nframes = nbuffers;
 	umem->mr_fd = sfd;
@@ -412,6 +454,8 @@ xdp_configure(struct pmd_internals *internals)
 	struct sockaddr_xdp sxdp;
 	struct xdp_ring_req req;
 	char ring_name[0x100];
+	char pool_name[0x100];
+
 	int ret = 0;
 	long int i;
 
@@ -426,9 +470,11 @@ xdp_configure(struct pmd_internals *internals)
 
 	for (i = 0; i < ETH_AF_XDP_NUM_BUFFERS; i++)
 		rte_ring_enqueue(internals->buf_ring, (void *)i);
-
+	snprintf(pool_name, 0x100, "%s_%s_%d", "af_xdp_pool",
+		  internals->if_name, internals->queue_idx);
 	internals->umem = xsk_alloc_and_mem_reg_buffers(internals->sfd,
-							ETH_AF_XDP_NUM_BUFFERS);
+							ETH_AF_XDP_NUM_BUFFERS,
+							pool_name);
 	if (internals->umem == NULL)
 		goto error;
 
@@ -475,28 +521,6 @@ error:
 	return -1;
 }
 
-static void dump_mempool(struct rte_mempool *mb_pool)
-{
-	struct rte_mempool_memhdr *memhdr;
-	struct rte_mbuf *mbuf1, *mbuf2;
-	printf("flags = %x\n", mb_pool->flags);
-	printf("size = %d\n", mb_pool->size);
-
-	printf("elt_size = %d\n", mb_pool->elt_size);
-	printf("header_size = %d\n", mb_pool->header_size);
-	printf("trailer_size = %d\n", mb_pool->trailer_size);
-	printf("nb_mem_chunk = %d\n", mb_pool->nb_mem_chunks);
-	STAILQ_FOREACH(memhdr, &mb_pool->mem_list, next) {
-		printf("base addr = %lx\n", (uint64_t)memhdr->addr);;
-	}
-	mbuf1 = rte_pktmbuf_alloc(mb_pool);
-	printf("mbuf->addr = %lx\n", (uint64_t)mbuf1->buf_addr);
-	mbuf2 = rte_pktmbuf_alloc(mb_pool);
-	printf("mbuf->addr = %lx\n", (uint64_t)mbuf2->buf_addr);
-	rte_pktmbuf_free(mbuf1);
-	rte_pktmbuf_free(mbuf2);
-}
-
 static int
 eth_rx_queue_setup(struct rte_eth_dev *dev,
                    uint16_t rx_queue_id,
@@ -509,12 +533,12 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
 	unsigned int buf_size, data_size;
 
 	RTE_ASSERT(rx_queue_id == 0);
-	internals->mb_pool = mb_pool;
+	internals->ext_mb_pool = mb_pool;
 	dump_mempool(mb_pool);
 	xdp_configure(internals);
 
 	/* Now get the space available for data in the mbuf */
-	buf_size = rte_pktmbuf_data_room_size(internals->mb_pool) -
+	buf_size = rte_pktmbuf_data_room_size(internals->ext_mb_pool) -
 		RTE_PKTMBUF_HEADROOM;
 	data_size = internals->umem->frame_size;
 
@@ -783,8 +807,13 @@ rte_pmd_af_xdp_remove(struct rte_vdev_device *dev)
 		return -1;
 
 	internals = eth_dev->data->dev_private;
-	rte_ring_free(internals->buf_ring);
-	rte_free(internals->umem);
+	if (internals->buf_ring)
+		rte_ring_free(internals->buf_ring);
+	if (internals->umem) {
+		if (internals->umem->mb_pool)
+			rte_mempool_free(internals->umem->mb_pool);
+		rte_free(internals->umem);
+	}
 	rte_free(eth_dev->data->dev_private);
 	rte_free(eth_dev->data);
 	close(internals->sfd);
