@@ -81,7 +81,9 @@ struct pmd_internals {
 	uint16_t port_id;
 	uint16_t queue_idx;
 	int ring_size;
-	struct rte_ring *buf_ring;
+
+	uint64_t mbuf_alloc_count;
+	uint64_t mbuf_free_count;
 };
 
 static const char *valid_arguments[] = {
@@ -139,6 +141,20 @@ static void hex_dump(void *pkt, size_t length, const char *prefix)
 }
 #endif
 
+static uint32_t
+mbuf_to_idx(struct pmd_internals *internals, struct rte_mbuf *mbuf)
+{
+	return (uint32_t)(((uint64_t)mbuf->buf_addr - (uint64_t)internals->umem->buffer)
+		>> internals->umem->frame_size_log2);
+}
+
+static struct rte_mbuf *
+idx_to_mbuf(struct pmd_internals *internals, uint32_t idx)
+{
+	return (struct rte_mbuf *)(void *)(internals->umem->buffer + (idx
+			<< internals->umem->frame_size_log2) + 0x40);
+}
+
 static uint16_t
 eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
@@ -152,17 +168,19 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		  nb_pkts : ETH_AF_XDP_RX_BATCH_SIZE;
 
 	struct xdp_desc descs[ETH_AF_XDP_RX_BATCH_SIZE];
-	void *indexes[ETH_AF_XDP_RX_BATCH_SIZE];
+	struct rte_mbuf *mbufs[ETH_AF_XDP_RX_BATCH_SIZE];
 	int rcvd, i;
 	/* fill rx ring */
 	if (rxq->num_free >= ETH_AF_XDP_RX_BATCH_SIZE) {
-		int n = rte_ring_dequeue_bulk(internals->buf_ring,
-					      indexes,
-					      ETH_AF_XDP_RX_BATCH_SIZE,
-					      NULL);
-		for (i = 0; i < n; i++)
-			descs[i].idx = (uint32_t)((long int)indexes[i]);
-		xq_enq(rxq, descs, n);
+		int ret = rte_mempool_get_bulk(internals->umem->mb_pool,
+					     (void *)mbufs,
+					     ETH_AF_XDP_RX_BATCH_SIZE);
+		if (!ret) {
+			internals->mbuf_alloc_count += ETH_AF_XDP_RX_BATCH_SIZE;
+			for (i = 0; i < ETH_AF_XDP_RX_BATCH_SIZE; i++)
+				descs[i].idx = mbuf_to_idx(internals, mbufs[i]);
+			xq_enq(rxq, descs, ETH_AF_XDP_RX_BATCH_SIZE);
+		}
 	}
 
 	/* read data */
@@ -188,10 +206,9 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		} else {
 			dropped++;
 		}
-		indexes[i] = (void *)((long int)idx);
+		rte_pktmbuf_free(idx_to_mbuf(internals, idx));
+		internals->mbuf_free_count++;
 	}
-
-	rte_ring_enqueue_bulk(internals->buf_ring, indexes, rcvd, NULL);
 
 	internals->rx_pkts += (rcvd-dropped);
 	internals->rx_bytes += rx_bytes;
@@ -220,10 +237,10 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	struct xdp_queue *txq = &internals->tx;
 	struct rte_mbuf *mbuf;
 	struct xdp_desc descs[ETH_AF_XDP_TX_BATCH_SIZE];
-	void *indexes[ETH_AF_XDP_TX_BATCH_SIZE];
+	struct rte_mbuf *mbufs[ETH_AF_XDP_TX_BATCH_SIZE];
 	uint16_t i, valid;
 	unsigned long tx_bytes = 0;
-
+	int ret;
 
 	nb_pkts = nb_pkts < ETH_AF_XDP_TX_BATCH_SIZE ?
 		  nb_pkts : ETH_AF_XDP_TX_BATCH_SIZE;
@@ -231,19 +248,24 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	if (txq->num_free < ETH_AF_XDP_TX_BATCH_SIZE*4) {
 		int n = xq_deq(txq, descs, ETH_AF_XDP_TX_BATCH_SIZE);
 		for (i = 0; i < n; i++)
-			indexes[i] = (void *)((long int)descs[i].idx);
-		rte_ring_enqueue_bulk(internals->buf_ring, indexes, n, NULL);
+			rte_pktmbuf_free(idx_to_mbuf(internals, descs[i].idx));
+		internals->mbuf_free_count+=n;
 	}
 	
 	nb_pkts = nb_pkts > txq->num_free ? txq->num_free : nb_pkts;
-	nb_pkts = rte_ring_dequeue_bulk(internals->buf_ring, indexes, nb_pkts, NULL);
+	ret = rte_mempool_get_bulk(internals->umem->mb_pool,
+				   (void *)mbufs,
+				   nb_pkts);
+	if (ret)
+		return 0;
+	internals->mbuf_alloc_count+= nb_pkts;
 
 	valid = 0;
 	for (i = 0; i < nb_pkts; i++) {
 		char *pkt;
 		mbuf = bufs[i];
 		if (mbuf->pkt_len <= (internals->umem->frame_size - ETH_AF_XDP_DATA_HEADROOM)) {
-			descs[valid].idx = (uint32_t)((long int)indexes[valid]);
+			descs[valid].idx = mbuf_to_idx(internals, mbufs[i]);
 			descs[valid].offset = ETH_AF_XDP_DATA_HEADROOM;
 			descs[valid].flags = 0;
 			descs[valid].len = mbuf->pkt_len;
@@ -258,9 +280,12 @@ eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	xq_enq(txq, descs, valid);
 	kick_tx(internals->sfd);
 
-	if (valid < nb_pkts)
-		rte_ring_enqueue_bulk(internals->buf_ring, &indexes[valid], nb_pkts-valid, NULL);
-	
+	if (valid < nb_pkts) {
+		for (i = valid; i < nb_pkts; i++)
+			rte_pktmbuf_free(mbufs[i]);
+		internals->mbuf_free_count += (nb_pkts-valid);
+	}
+
 	internals->err_pkts += (nb_pkts - valid);
 	internals->tx_pkts += valid;
 	internals->tx_bytes += tx_bytes;
@@ -272,12 +297,12 @@ static void
 fill_rx_desc(struct pmd_internals *internals)
 {
 	int num_free = internals->rx.num_free;
-	void *p=NULL;
 	int i;
 	for (i = 0; i < num_free; i++ ) {
 		struct xdp_desc desc = {};
-		rte_ring_dequeue(internals->buf_ring, &p);
-		desc.idx = (uint32_t)((long int)p);
+		struct rte_mbuf *mbuf = rte_pktmbuf_alloc(internals->umem->mb_pool);
+		internals->mbuf_alloc_count++;
+		desc.idx = mbuf_to_idx(internals, mbuf);
 		xq_enq(&internals->rx, &desc, 1);
 	}
 }
@@ -323,22 +348,25 @@ eth_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info)
 static int
 eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 {
-	const struct pmd_internals *internal = dev->data->dev_private;
+	const struct pmd_internals *internals = dev->data->dev_private;
 
 	stats->ipackets = stats->q_ipackets[0] =
-		internal->rx_pkts;
+		internals->rx_pkts;
 	stats->ibytes = stats->q_ibytes[0] =
-		internal->rx_bytes;
+		internals->rx_bytes;
 	stats->imissed =
-		internal->rx_dropped;
+		internals->rx_dropped;
 
 	stats->opackets = stats->q_opackets[0]
-		= internal->tx_pkts;
+		= internals->tx_pkts;
 	stats->oerrors = stats->q_errors[0] =
-		internal->err_pkts;
+		internals->err_pkts;
 	stats->obytes =stats->q_obytes[0] =
-		internal->tx_bytes;
+		internals->tx_bytes;
 
+	printf("total alloc = %ld\n", internals->mbuf_alloc_count);
+	printf("total freed = %ld\n", internals->mbuf_free_count);
+	printf("delta = %ld\n", internals->mbuf_alloc_count - internals->mbuf_free_count);
 	return 0;
 }
 
@@ -399,8 +427,10 @@ static void dump_mempool(struct rte_mempool *mb_pool)
 	}
 	mbuf1 = rte_pktmbuf_alloc(mb_pool);
 	printf("mbuf->addr = %lx\n", (uint64_t)mbuf1->buf_addr);
+	printf("mbuf1 addr = %lx\n", (uint64_t)mbuf1);
 	mbuf2 = rte_pktmbuf_alloc(mb_pool);
 	printf("mbuf->addr = %lx\n", (uint64_t)mbuf2->buf_addr);
+	printf("mbuf2 addr = %lx\n", (uint64_t)mbuf2);
 	rte_pktmbuf_free(mbuf1);
 	rte_pktmbuf_free(mbuf2);
 }
@@ -453,30 +483,17 @@ xdp_configure(struct pmd_internals *internals)
 {
 	struct sockaddr_xdp sxdp;
 	struct xdp_ring_req req;
-	char ring_name[0x100];
 	char pool_name[0x100];
 
 	int ret = 0;
-	long int i;
 
-	snprintf(ring_name, 0x100, "%s_%s_%d", "af_xdp_ring",
-		 internals->if_name, internals->queue_idx);
-	internals->buf_ring = rte_ring_create(ring_name,
-					      ETH_AF_XDP_NUM_BUFFERS,
-					      SOCKET_ID_ANY,
-					      0x0);
-	if (internals->buf_ring == NULL)
-		return -1;
-
-	for (i = 0; i < ETH_AF_XDP_NUM_BUFFERS; i++)
-		rte_ring_enqueue(internals->buf_ring, (void *)i);
 	snprintf(pool_name, 0x100, "%s_%s_%d", "af_xdp_pool",
 		  internals->if_name, internals->queue_idx);
 	internals->umem = xsk_alloc_and_mem_reg_buffers(internals->sfd,
 							ETH_AF_XDP_NUM_BUFFERS,
 							pool_name);
 	if (internals->umem == NULL)
-		goto error;
+		return -1;
 
 	req.mr_fd = internals->umem->mr_fd;
 	req.desc_nr = internals->ring_size;
@@ -515,10 +532,6 @@ xdp_configure(struct pmd_internals *internals)
 	RTE_ASSERT(ret == 0);
 
 	return ret;
-error:
-	rte_ring_free(internals->buf_ring);
-	internals->buf_ring = NULL;
-	return -1;
 }
 
 static int
@@ -807,8 +820,6 @@ rte_pmd_af_xdp_remove(struct rte_vdev_device *dev)
 		return -1;
 
 	internals = eth_dev->data->dev_private;
-	if (internals->buf_ring)
-		rte_ring_free(internals->buf_ring);
 	if (internals->umem) {
 		if (internals->umem->mb_pool)
 			rte_mempool_free(internals->umem->mb_pool);
