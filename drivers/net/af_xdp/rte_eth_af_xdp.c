@@ -475,6 +475,28 @@ error:
 	return -1;
 }
 
+static void dump_mempool(struct rte_mempool *mb_pool)
+{
+	struct rte_mempool_memhdr *memhdr;
+	struct rte_mbuf *mbuf1, *mbuf2;
+	printf("flags = %x\n", mb_pool->flags);
+	printf("size = %d\n", mb_pool->size);
+
+	printf("elt_size = %d\n", mb_pool->elt_size);
+	printf("header_size = %d\n", mb_pool->header_size);
+	printf("trailer_size = %d\n", mb_pool->trailer_size);
+	printf("nb_mem_chunk = %d\n", mb_pool->nb_mem_chunks);
+	STAILQ_FOREACH(memhdr, &mb_pool->mem_list, next) {
+		printf("base addr = %lx\n", (uint64_t)memhdr->addr);;
+	}
+	mbuf1 = rte_pktmbuf_alloc(mb_pool);
+	printf("mbuf->addr = %lx\n", (uint64_t)mbuf1->buf_addr);
+	mbuf2 = rte_pktmbuf_alloc(mb_pool);
+	printf("mbuf->addr = %lx\n", (uint64_t)mbuf2->buf_addr);
+	rte_pktmbuf_free(mbuf1);
+	rte_pktmbuf_free(mbuf2);
+}
+
 static int
 eth_rx_queue_setup(struct rte_eth_dev *dev,
                    uint16_t rx_queue_id,
@@ -488,6 +510,7 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
 
 	RTE_ASSERT(rx_queue_id == 0);
 	internals->mb_pool = mb_pool;
+	dump_mempool(mb_pool);
 	xdp_configure(internals);
 
 	/* Now get the space available for data in the mbuf */
