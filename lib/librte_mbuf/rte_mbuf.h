@@ -1079,6 +1079,12 @@ rte_pktmbuf_pool_create(const char *name, unsigned n,
 	unsigned cache_size, uint16_t priv_size, uint16_t data_room_size,
 	int socket_id);
 
+struct rte_mempool *
+rte_pktmbuf_pool_create_with_flags(const char *name, unsigned n,
+	unsigned cache_size, uint16_t priv_size, uint16_t data_room_size,
+	unsigned flags, int socket_id);
+
+
 /**
  * Create a mbuf pool with a given mempool ops name
  *
@@ -1119,7 +1125,7 @@ rte_pktmbuf_pool_create(const char *name, unsigned n,
 struct rte_mempool * __rte_experimental
 rte_pktmbuf_pool_create_by_ops(const char *name, unsigned int n,
 	unsigned int cache_size, uint16_t priv_size, uint16_t data_room_size,
-	int socket_id, const char *ops_name);
+	unsigned int flags, int socket_id, const char *ops_name);
 
 /**
  * Get the data room size of mbufs stored in a pktmbuf_pool
