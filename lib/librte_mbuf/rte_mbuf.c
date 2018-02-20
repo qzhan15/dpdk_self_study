@@ -179,9 +179,18 @@ rte_pktmbuf_pool_create(const char *name, unsigned int n,
 	int socket_id)
 {
 	return rte_pktmbuf_pool_create_by_ops(name, n, cache_size, priv_size,
-			data_room_size, MEMPOOL_F_NO_SPREAD, socket_id, NULL);
+			data_room_size, 0, socket_id, NULL);
 }
 
+/* helper to create a mbuf pool with NO_SPREAD */
+struct rte_mempool *
+rte_pktmbuf_pool_create_no_spread(const char *name, unsigned int n,
+	unsigned int cache_size, uint16_t priv_size, uint16_t data_room_size,
+	int socket_id)
+{
+	return rte_pktmbuf_pool_create_by_ops(name, n, cache_size, priv_size,
+			data_room_size, MEMPOOL_F_NO_SPREAD, socket_id, NULL);
+}
 /* do some sanity checks on a mbuf: panic if it fails */
 void
 rte_mbuf_sanity_check(const struct rte_mbuf *m, int is_header)

@@ -1079,6 +1079,12 @@ rte_pktmbuf_pool_create(const char *name, unsigned n,
 	unsigned cache_size, uint16_t priv_size, uint16_t data_room_size,
 	int socket_id);
 
+struct rte_mempool *
+rte_pktmbuf_pool_create_no_spread(const char *name, unsigned n,
+	unsigned cache_size, uint16_t priv_size, uint16_t data_room_size,
+	int socket_id);
+
+
 /**
  * Create a mbuf pool with a given mempool ops name
  *
