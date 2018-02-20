@@ -78,6 +78,8 @@ struct pmd_internals {
 	volatile unsigned long tx_bytes;
 
 	uint16_t port_id;
+	uint16_t queue_idx;
+	int ring_size;
 	struct rte_ring *buf_ring;
 };
 
@@ -370,6 +372,109 @@ eth_link_update(struct rte_eth_dev *dev __rte_unused,
 	return 0;
 }
 
+static struct xdp_umem *xsk_alloc_and_mem_reg_buffers(int sfd, size_t nbuffers)
+{
+	struct xdp_mr_req req = { .frame_size = ETH_AF_XDP_FRAME_SIZE,
+				  .data_headroom = ETH_AF_XDP_DATA_HEADROOM };
+	struct xdp_umem *umem;
+	void *bufs;
+	int ret;
+
+	ret = posix_memalign((void **)&bufs, getpagesize(),
+			     nbuffers * req.frame_size);
+	if (ret)
+		return NULL;
+
+	umem = calloc(1, sizeof(*umem));
+	if (umem == NULL) {
+		free(bufs);
+		return NULL;
+	}
+
+	req.addr = (unsigned long)bufs;
+	req.len = nbuffers * req.frame_size;
+	ret = setsockopt(sfd, SOL_XDP, XDP_MEM_REG, &req, sizeof(req));
+	RTE_ASSERT(ret == 0);
+
+	umem->frame_size = ETH_AF_XDP_FRAME_SIZE;
+	umem->frame_size_log2 = 11;
+	umem->buffer = bufs;
+	umem->size = nbuffers * req.frame_size;
+	umem->nframes = nbuffers;
+	umem->mr_fd = sfd;
+
+	return umem;
+}
+
+static int
+xdp_configure(struct pmd_internals *internals)
+{
+	struct sockaddr_xdp sxdp;
+	struct xdp_ring_req req;
+	char ring_name[0x100];
+	int ret = 0;
+	long int i;
+
+	snprintf(ring_name, 0x100, "%s_%s_%d", "af_xdp_ring",
+		 internals->if_name, internals->queue_idx);
+	internals->buf_ring = rte_ring_create(ring_name,
+					      ETH_AF_XDP_NUM_BUFFERS,
+					      SOCKET_ID_ANY,
+					      0x0);
+	if (internals->buf_ring == NULL)
+		return -1;
+
+	for (i = 0; i < ETH_AF_XDP_NUM_BUFFERS; i++)
+		rte_ring_enqueue(internals->buf_ring, (void *)i);
+
+	internals->umem = xsk_alloc_and_mem_reg_buffers(internals->sfd,
+							ETH_AF_XDP_NUM_BUFFERS);
+	if (internals->umem == NULL)
+		goto error;
+
+	req.mr_fd = internals->umem->mr_fd;
+	req.desc_nr = internals->ring_size;
+
+	ret = setsockopt(internals->sfd, SOL_XDP, XDP_RX_RING, &req, sizeof(req));
+	RTE_ASSERT(ret == 0);
+
+	ret = setsockopt(internals->sfd, SOL_XDP, XDP_TX_RING, &req, sizeof(req));
+	RTE_ASSERT(ret == 0);
+
+	internals->rx.ring = mmap(0, req.desc_nr * sizeof(struct xdp_desc),
+				  PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_LOCKED | MAP_POPULATE,
+				  internals->sfd,
+				  XDP_PGOFF_RX_RING);
+	RTE_ASSERT(internals->rx.ring != MAP_FAILED);
+
+	internals->rx.num_free = req.desc_nr;
+	internals->rx.ring_mask = req.desc_nr - 1;
+
+	internals->tx.ring = mmap(0, req.desc_nr * sizeof(struct xdp_desc),
+				  PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_LOCKED | MAP_POPULATE,
+				  internals->sfd,
+				  XDP_PGOFF_TX_RING);
+	RTE_ASSERT(internals->tx.ring != MAP_FAILED);
+
+	internals->tx.num_free = req.desc_nr;
+	internals->tx.ring_mask = req.desc_nr - 1;
+
+	sxdp.sxdp_family = PF_XDP;
+	sxdp.sxdp_ifindex = internals->if_index;
+	sxdp.sxdp_queue_id = internals->queue_idx;
+
+	ret = bind(internals->sfd, (struct sockaddr *)&sxdp, sizeof(sxdp));
+	RTE_ASSERT(ret == 0);
+
+	return ret;
+error:
+	rte_ring_free(internals->buf_ring);
+	internals->buf_ring = NULL;
+	return -1;
+}
+
 static int
 eth_rx_queue_setup(struct rte_eth_dev *dev,
                    uint16_t rx_queue_id,
@@ -383,6 +488,7 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
 
 	RTE_ASSERT(rx_queue_id == 0);
 	internals->mb_pool = mb_pool;
+	xdp_configure(internals);
 
 	/* Now get the space available for data in the mbuf */
 	buf_size = rte_pktmbuf_data_room_size(internals->mb_pool) -
@@ -514,40 +620,6 @@ parse_parameters(struct rte_kvargs *kvlist,
 	}
 }
 
-static struct xdp_umem *xsk_alloc_and_mem_reg_buffers(int sfd, size_t nbuffers)
-{
-	struct xdp_mr_req req = { .frame_size = ETH_AF_XDP_FRAME_SIZE,
-				  .data_headroom = ETH_AF_XDP_DATA_HEADROOM };
-	struct xdp_umem *umem;
-	void *bufs;
-	int ret;
-
-	ret = posix_memalign((void **)&bufs, getpagesize(),
-			     nbuffers * req.frame_size);
-	if (ret)
-		return NULL;
-
-	umem = calloc(1, sizeof(*umem));
-	if (umem == NULL) {
-		free(bufs);
-		return NULL;
-	}	
-
-	req.addr = (unsigned long)bufs;
-	req.len = nbuffers * req.frame_size;
-	ret = setsockopt(sfd, SOL_XDP, XDP_MEM_REG, &req, sizeof(req));
-	RTE_ASSERT(ret == 0);
-
-	umem->frame_size = ETH_AF_XDP_FRAME_SIZE;
-	umem->frame_size_log2 = 11; 
-	umem->buffer = bufs;
-	umem->size = nbuffers * req.frame_size;
-	umem->nframes = nbuffers;
-	umem->mr_fd = sfd;
-
-	return umem;
-}
-
 static int
 get_iface_info(const char *if_name,
 	       struct ether_addr *eth_addr,
@@ -587,12 +659,8 @@ init_internals(struct rte_vdev_device* dev,
 	struct rte_eth_dev *eth_dev = NULL;
 	struct rte_eth_dev_data *data = NULL;
 	const unsigned int numa_node = dev->device.numa_node;
-	struct pmd_internals *internals;
-	struct sockaddr_xdp sxdp;
-	struct xdp_ring_req req;
-	char ring_name[0x100];
+	struct pmd_internals *internals = NULL;
 	int ret;
-	long int i;
 
 	data = rte_zmalloc_socket(name, sizeof(*internals), 0, numa_node);
 	if (data == NULL)
@@ -602,6 +670,8 @@ init_internals(struct rte_vdev_device* dev,
 	if (internals == NULL)
 		goto error_1;
 
+	internals->queue_idx = queue_idx;
+	internals->ring_size = ring_size;;
 	strcpy(internals->if_name, if_name);
 	internals->sfd = socket(PF_XDP, SOCK_RAW, 0);
 	if (internals->sfd <0)
@@ -610,61 +680,11 @@ init_internals(struct rte_vdev_device* dev,
 	ret = get_iface_info(if_name, &internals->eth_addr, &internals->if_index);
 	if (ret)
 		goto error_3;
-	snprintf(ring_name, 0x100, "%s_%s_%d", "af_xdp_ring", if_name, queue_idx);
-	internals->buf_ring = rte_ring_create(ring_name,
-					      ETH_AF_XDP_NUM_BUFFERS,
-					      SOCKET_ID_ANY,
-					      0x0);
-	if (internals->buf_ring == NULL)
-		goto error_3;
-
-	for (i = 0; i < ETH_AF_XDP_NUM_BUFFERS; i++)
-		rte_ring_enqueue(internals->buf_ring, (void *)i);	
-
-	internals->umem = xsk_alloc_and_mem_reg_buffers(internals->sfd,
-							ETH_AF_XDP_NUM_BUFFERS);
-	if (internals->umem == NULL)
-		goto error_4;
-
-	req.mr_fd = internals->umem->mr_fd;
-	req.desc_nr = ring_size;
-
-	ret = setsockopt(internals->sfd, SOL_XDP, XDP_RX_RING, &req, sizeof(req));
-	RTE_ASSERT(ret == 0);
-
-	ret = setsockopt(internals->sfd, SOL_XDP, XDP_TX_RING, &req, sizeof(req));
-	RTE_ASSERT(ret == 0);
-
-	internals->rx.ring = mmap(0, req.desc_nr * sizeof(struct xdp_desc),
-				  PROT_READ | PROT_WRITE,
-				  MAP_SHARED | MAP_LOCKED | MAP_POPULATE,
-				  internals->sfd,
-				  XDP_PGOFF_RX_RING);
-	RTE_ASSERT(internals->rx.ring != MAP_FAILED);
-
-	internals->rx.num_free = req.desc_nr;
-	internals->rx.ring_mask = req.desc_nr - 1;
-
-	internals->tx.ring = mmap(0, req.desc_nr * sizeof(struct xdp_desc),
-				  PROT_READ | PROT_WRITE,
-				  MAP_SHARED | MAP_LOCKED | MAP_POPULATE,
-				  internals->sfd,
-				  XDP_PGOFF_TX_RING);
-	RTE_ASSERT(internals->tx.ring != MAP_FAILED);
-
-	internals->tx.num_free = req.desc_nr;
-	internals->tx.ring_mask = req.desc_nr - 1;
-
-	sxdp.sxdp_family = PF_XDP;
-	sxdp.sxdp_ifindex = internals->if_index;
-	sxdp.sxdp_queue_id = queue_idx;
-
-	ret = bind(internals->sfd, (struct sockaddr *)&sxdp, sizeof(sxdp));
-	RTE_ASSERT(ret == 0);
 
 	eth_dev = rte_eth_vdev_allocate(dev, 0);
 	if (eth_dev == NULL)
 		goto error_3;
+
 	rte_memcpy(data, eth_dev->data, sizeof(*data));
 	internals->port_id = eth_dev->data->port_id;
 	data->dev_private = internals;
@@ -680,8 +700,6 @@ init_internals(struct rte_vdev_device* dev,
 	eth_dev->tx_pkt_burst = eth_af_xdp_tx;
 
 	return 0;
-error_4:
-	rte_ring_free(internals->buf_ring);
 
 error_3:
 	close(internals->sfd);
