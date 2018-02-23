@@ -45,7 +45,7 @@ LIBABIVER := 1
 LINUX_HEADER_DIR := /opt/af_xdp/linux_headers/include
 TOOLS_DIR := /root/github/kernel_af_xdp/tools
 
-CFLAGS += -O3 -I$(LINUX_HEADER_DIR) -I$(TOOLS_DIR)/lib  -I$(TOOLS_DIR)/perf -I$(TOOLS_DIR)/include -Wno-error=sign-compare -Wno-error=cast-qual
+CFLAGS += -O3 -I$(LINUX_HEADER_DIR) -I$(TOOLS_DIR)/perf -I$(TOOLS_DIR)/include -Wno-error=sign-compare -Wno-error=cast-qual
 CFLAGS += $(WERROR_FLAGS)
 LDLIBS += -lrte_eal -lrte_mbuf -lrte_mempool -lrte_ring
 LDLIBS += -lrte_ethdev -lrte_net -lrte_kvargs
