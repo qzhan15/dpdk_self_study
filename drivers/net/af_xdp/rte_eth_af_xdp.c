@@ -15,6 +15,7 @@
 
 #include <linux/if_ether.h>
 #include <linux/if_xdp.h>
+#include <linux/if_link.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/types.h>
@@ -24,6 +25,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include "xdpsock_queue.h"
+#include "bpf_load.h"
 
 #ifndef SOL_XDP
 #define SOL_XDP 283
@@ -809,9 +811,21 @@ init_internals(struct rte_vdev_device* dev,
 	if (ret)
 		goto error_3;
 
+	set_link_xdp_fd(internals->if_index, -1, XDP_FLAGS_SKB_MODE);
+
+	if (load_bpf_file("xdpsock_kern.o")) {
+		printf("load bpf file failed\n");
+		goto error_3;
+	}
+	RTE_ASSERT(prog_fd[0]);
+
+	if (set_link_xdp_fd(internals->if_index, prog_fd[0], XDP_FLAGS_SKB_MODE)) {
+		goto error_3;
+	}
+
 	eth_dev = rte_eth_vdev_allocate(dev, 0);
 	if (eth_dev == NULL)
-		goto error_3;
+		goto error_4;
 
 	rte_memcpy(data, eth_dev->data, sizeof(*data));
 	internals->port_id = eth_dev->data->port_id;
@@ -828,6 +842,9 @@ init_internals(struct rte_vdev_device* dev,
 	eth_dev->tx_pkt_burst = eth_af_xdp_tx;
 
 	return 0;
+
+error_4:
+	set_link_xdp_fd(internals->if_index, -1, XDP_FLAGS_SKB_MODE);
 
 error_3:
 	close(internals->sfd);
