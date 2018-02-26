@@ -386,6 +386,7 @@ extern uint8_t dcb_config;
 extern uint8_t dcb_test;
 
 extern uint16_t mbuf_data_size; /**< Mbuf data space size. */
+extern uint16_t mp_flags;  /**< flags for mempool creation. */
 extern uint32_t param_total_num_mbufs;
 
 extern uint16_t stats_period;

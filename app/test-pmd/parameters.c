@@ -61,6 +61,7 @@ usage(char* progname)
 	       "--tx-first | --stats-period=PERIOD | "
 	       "--coremask=COREMASK --portmask=PORTMASK --numa "
 	       "--mbuf-size= | --total-num-mbufs= | "
+	       "--mp-flags= | "
 	       "--nb-cores= | --nb-ports= | "
 #ifdef RTE_LIBRTE_CMDLINE
 	       "--eth-peers-configfile= | "
@@ -105,6 +106,7 @@ usage(char* progname)
 	printf("  --socket-num=N: set socket from which all memory is allocated "
 	       "in NUMA mode.\n");
 	printf("  --mbuf-size=N: set the data size of mbuf to N bytes.\n");
+	printf("  --mp-flags=N: set the flags when create mbuf memory pool.\n");
 	printf("  --total-num-mbufs=N: set the number of mbufs to be allocated "
 	       "in mbuf pools.\n");
 	printf("  --max-pkt-len=N: set the maximum size of packet to N bytes.\n");
@@ -568,6 +570,7 @@ launch_args_parse(int argc, char** argv)
 		{ "ring-numa-config",           1, 0, 0 },
 		{ "socket-num",			1, 0, 0 },
 		{ "mbuf-size",			1, 0, 0 },
+		{ "mp-flags",			1, 0, 0 },
 		{ "total-num-mbufs",		1, 0, 0 },
 		{ "max-pkt-len",		1, 0, 0 },
 		{ "pkt-filter-mode",            1, 0, 0 },
@@ -769,6 +772,15 @@ launch_args_parse(int argc, char** argv)
 					rte_exit(EXIT_FAILURE,
 						 "mbuf-size should be > 0 and < 65536\n");
 			}
+			if (!strcmp(lgopts[opt_idx].name, "mp-flags")) {
+				n = atoi(optarg);
+				if (n > 0 && n <= 0xFFFF)
+					mp_flags = (uint16_t)n;
+				else
+					rte_exit(EXIT_FAILURE,
+						 "mp-flags should be > 0 and < 65536\n");
+			}
+
 			if (!strcmp(lgopts[opt_idx].name, "total-num-mbufs")) {
 				n = atoi(optarg);
 				if (n > 1024)
