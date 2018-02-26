@@ -567,6 +567,8 @@ rte_mempool_populate_default(struct rte_mempool *mp)
 		pg_shift = 0; /* not needed, zone is physically contiguous */
 		pg_sz = 0;
 		align = RTE_CACHE_LINE_SIZE;
+		if (mp->flags & MEMPOOL_F_PAGE_ALIGN)
+			align = getpagesize();
 	} else {
 		pg_sz = getpagesize();
 		pg_shift = rte_bsf32(pg_sz);
