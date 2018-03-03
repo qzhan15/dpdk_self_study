@@ -11,6 +11,7 @@
 
 #include <linux/if_ether.h>
 #include <linux/if_xdp.h>
+#include <linux/if_link.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/types.h>
@@ -20,6 +21,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include "xdpsock_queue.h"
+#include "bpf_load.h"
 
 #ifndef SOL_XDP
 #define SOL_XDP 283
@@ -81,6 +83,9 @@ struct pmd_internals {
 	uint16_t port_id;
 	uint16_t queue_idx;
 	int ring_size;
+
+	uint32_t xdp_flags;
+	int bpf_fd;
 };
 
 static const char * const valid_arguments[] = {
@@ -96,6 +101,39 @@ static struct rte_eth_link pmd_link = {
 	.link_status = ETH_LINK_DOWN,
 	.link_autoneg = ETH_LINK_AUTONEG
 };
+
+static int load_bpf(struct pmd_internals *internals)
+{
+	/* need fix: hard coded bpf file */
+	int fd = load_bpf_file("xdpsock_kern.o");
+
+	if (fd < 0)
+		return -1;
+
+	internals->bpf_fd = fd;
+	return 0;
+}
+
+static int link_bpf_file(struct pmd_internals *internals)
+{
+	if (!set_link_xdp_fd(internals->if_index,
+			     internals->bpf_fd,
+			     XDP_FLAGS_DRV_MODE))
+		internals->xdp_flags = XDP_FLAGS_DRV_MODE;
+	else if (!set_link_xdp_fd(internals->if_index,
+				  internals->bpf_fd,
+				  XDP_FLAGS_SKB_MODE))
+		internals->xdp_flags = XDP_FLAGS_SKB_MODE;
+	else
+		return -1;
+
+	return 0;
+}
+
+static void unlink_bpf_file(struct pmd_internals *internals)
+{
+	set_link_xdp_fd(internals->if_index, -1, internals->xdp_flags);
+}
 
 static void *get_pkt_data(struct pmd_internals *internals,
 			  uint32_t index,
@@ -379,8 +417,26 @@ eth_stats_reset(struct rte_eth_dev *dev)
 }
 
 static void
-eth_dev_close(struct rte_eth_dev *dev __rte_unused)
+eth_dev_close(struct rte_eth_dev *dev)
 {
+	struct pmd_internals *internals = dev->data->dev_private;
+
+	if (internals->xdp_flags) {
+		unlink_bpf_file(internals);
+		internals->xdp_flags = 0;
+	}
+
+	if (internals->umem) {
+		if (internals->umem->mb_pool && !internals->share_mb_pool)
+			rte_mempool_free(internals->umem->mb_pool);
+		free(internals->umem);
+		internals->umem = NULL;
+	}
+
+	if (internals->sfd != -1) {
+		close(internals->sfd);
+		internals->sfd = -1;
+	}
 }
 
 static void
@@ -742,9 +798,17 @@ init_internals(struct rte_vdev_device *dev,
 	if (ret)
 		goto error_3;
 
+	if (load_bpf(internals)) {
+		printf("load bpf file failed\n");
+		goto error_3;
+	}
+
+	if (link_bpf_file(internals))
+		goto error_3;
+
 	eth_dev = rte_eth_vdev_allocate(dev, 0);
 	if (!eth_dev)
-		goto error_3;
+		goto error_4;
 
 	rte_memcpy(data, eth_dev->data, sizeof(*data));
 	internals->port_id = eth_dev->data->port_id;
@@ -761,6 +825,9 @@ init_internals(struct rte_vdev_device *dev,
 	eth_dev->tx_pkt_burst = eth_af_xdp_tx;
 
 	return 0;
+
+error_4:
+	unlink_bpf_file(internals);
 
 error_3:
 	close(internals->sfd);
@@ -807,7 +874,6 @@ static int
 rte_pmd_af_xdp_remove(struct rte_vdev_device *dev)
 {
 	struct rte_eth_dev *eth_dev = NULL;
-	struct pmd_internals *internals;
 
 	RTE_LOG(INFO, PMD, "Closing AF_XDP ethdev on numa socket %u\n",
 		rte_socket_id());
@@ -820,15 +886,9 @@ rte_pmd_af_xdp_remove(struct rte_vdev_device *dev)
 	if (!eth_dev)
 		return -1;
 
-	internals = eth_dev->data->dev_private;
-	if (internals->umem) {
-		if (internals->umem->mb_pool && !internals->share_mb_pool)
-			rte_mempool_free(internals->umem->mb_pool);
-		rte_free(internals->umem);
-	}
+	eth_dev_close(eth_dev);
 	rte_free(eth_dev->data->dev_private);
 	rte_free(eth_dev->data);
-	close(internals->sfd);
 
 	rte_eth_dev_release_port(eth_dev);
 
