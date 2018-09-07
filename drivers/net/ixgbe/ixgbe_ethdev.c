@@ -1106,6 +1106,14 @@ eth_ixgbe_dev_init(struct rte_eth_dev *eth_dev, void *init_params __rte_unused)
 	hw->hw_addr = (void *)pci_dev->mem_resource[0].addr;
 	hw->allow_unsupported_sfp = 1;
 
+	if (hw->mac.ops.fw_recovery_mode && hw->mac.ops.fw_recovery_mode(hw)) {
+		PMD_INIT_LOG(ERR, "\nERROR:"
+			"Firmware recovery mode detected. Limiting functionality.\n"
+			"Refer to the Intel(R) Ethernet Adapters and Devices "
+			"User Guide for details on firmware recovery mode.");
+		return -EIO;
+	}
+
 	/* Initialize the shared code (base driver) */
 #ifdef RTE_LIBRTE_IXGBE_BYPASS
 	diag = ixgbe_bypass_init_shared_code(hw);
