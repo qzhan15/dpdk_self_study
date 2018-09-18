@@ -67,6 +67,10 @@ New Features
   SR-IOV option in Hyper-V and Azure. This is an alternative to the previous
   vdev_netvsc, tap, and failsafe drivers combination.
 
+* **Added a devarg to use the latest supported vector path.**
+  A new devarg ``use-latest-supported-vec`` was introduced to allow users to
+  choose the latest vector path that the platform supported. For example, users
+  can use AVX2 vector path on BDW/HSW to get better performance.
 
 API Changes
 -----------
